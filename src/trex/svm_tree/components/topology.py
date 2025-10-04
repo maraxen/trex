@@ -1,7 +1,7 @@
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float, PRNGKeyArray, PyTree
+from jaxtyping import Array, Float, PRNGKeyArray
 
 from trex.tree import enforce_graph_constraints, update_tree
 
@@ -12,6 +12,7 @@ class DifferentiableTopology(eqx.Module):
     Gumbel-Softmax trick and applies a gating mechanism to prune connections.
     It also computes regularization losses to encourage sparsity and enforce
     graph constraints.
+
     Attributes:
         tree_params: Trainable parameters for the tree's connections.
         gate_logits: Trainable logits for the gating mechanism.
@@ -19,6 +20,7 @@ class DifferentiableTopology(eqx.Module):
         n_ancestors: The number of ancestor nodes in the tree.
         sparsity_regularization_strength: Weight for the sparsity loss.
         graph_constraint_scale: Scaling factor for the graph constraint loss.
+
     """
 
     tree_params: Float[Array, " n_all_minus_1 n_ancestors"]
@@ -39,21 +41,23 @@ class DifferentiableTopology(eqx.Module):
         graph_constraint_scale: float = 10.0,
     ):
         """Initializes the DifferentiableTopology component.
+
         Args:
             key: A JAX random key.
             n_leaves: The number of leaf nodes.
             n_ancestors: The number of ancestor nodes.
             sparsity_regularization_strength: The strength of the L1 sparsity penalty.
             graph_constraint_scale: The scaling factor for the graph constraint loss.
+
         """
         tree_key, gate_key = jax.random.split(key)
         n_all_minus_1 = n_leaves + n_ancestors - 1
 
         self.tree_params = jax.random.normal(
-            tree_key, (n_all_minus_1, n_ancestors)
+            tree_key, (n_all_minus_1, n_ancestors),
         )
         self.gate_logits = jax.random.normal(
-            gate_key, (n_all_minus_1, n_ancestors)
+            gate_key, (n_all_minus_1, n_ancestors),
         )
 
         self.n_leaves = n_leaves
@@ -62,34 +66,40 @@ class DifferentiableTopology(eqx.Module):
         self.graph_constraint_scale = graph_constraint_scale
 
     def __call__(
-        self, key: PRNGKeyArray, temperature: float = 1.0
+        self, key: PRNGKeyArray, temperature: float = 1.0,
     ) -> Float[Array, "n_nodes n_nodes"]:
         """Computes the soft adjacency matrix of the tree.
+
         Args:
             key: A JAX random key for the Gumbel-Softmax trick.
             temperature: The temperature for the Gumbel-Softmax.
+
         Returns:
             The soft adjacency matrix representing the tree topology.
+
         """
         params = {"tree_params": self.tree_params}
         gates = jax.nn.sigmoid(self.gate_logits)
         return update_tree(key, params, temperature=temperature, gates=gates)
 
     def loss(
-        self, adjacency: Float[Array, "n_nodes n_nodes"]
+        self, adjacency: Float[Array, "n_nodes n_nodes"],
     ) -> Float[Array, ""]:
         """Computes the regularization losses for the topology.
+
         Args:
             adjacency: The current soft adjacency matrix of the tree.
+
         Returns:
             The total regularization loss.
+
         """
         # 1. Sparsity loss on the gates (L1 regularization)
         sparsity_loss = jnp.mean(jnp.abs(self.gate_logits))
 
         # 2. Graph constraint loss
         graph_loss = enforce_graph_constraints(
-            adjacency, self.graph_constraint_scale
+            adjacency, self.graph_constraint_scale,
         )
 
         total_loss = (

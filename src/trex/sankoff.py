@@ -19,7 +19,7 @@ from trex.utils.types import (
 )
 
 
-@partial(jax.jit, static_argnames=("verbose"))
+@jax.jit
 def run_dp(
   adjacency_matrix: AdjacencyMatrix,
   dynamic_programming_table: DPTable,
