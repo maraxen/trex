@@ -127,11 +127,14 @@ def enforce_graph_constraints(
   """Calculate a loss to enforce that the tree is binary.
   This loss penalizes deviations from the constraint that each ancestor node
   should have exactly two children.
+
   Args:
       adjacency: The soft tree topology.
       scaling_factor: A scaling factor for the loss.
+
   Returns:
       The calculated constraint-forcing loss.
+
   """
   n_total_nodes = adjacency.shape[0]
   n_ancestor_nodes = (n_total_nodes - 1) // 2

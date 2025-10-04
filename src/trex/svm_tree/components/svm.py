@@ -1,4 +1,3 @@
-from typing import Optional
 
 import equinox as eqx
 import jax
@@ -16,7 +15,7 @@ class LinearSVM(eqx.Module):
         self,
         in_features: int,
         *,
-        out_features: Optional[int] = None,
+        out_features: int | None = None,
         key: "jax.random.PRNGKey",
     ):
         """Initializes the LinearSVM module.
@@ -26,6 +25,7 @@ class LinearSVM(eqx.Module):
             out_features: The number of output classes. If None, a single output is
                 assumed.
             key: A JAX PRNG key used to initialize the weights.
+
         """
         wkey, bkey = jax.random.split(key)
         if out_features is None:
@@ -43,5 +43,6 @@ class LinearSVM(eqx.Module):
 
         Returns:
             The decision function output.
+
         """
         return jnp.dot(self.weights, x) + self.bias

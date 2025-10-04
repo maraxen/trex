@@ -28,7 +28,7 @@ def test_run_dp_basic():
   cost_matrix = jnp.array([[0, 1], [1, 0]], dtype=jnp.float32)
   dp = jnp.full((3, n_states), 1e5, dtype=jnp.float32)
   back = jnp.zeros((3, n_states, 4), dtype=jnp.float32)
-  dp_out, back_out = run_dp(adj, dp, back, seqs, cost_matrix, verbose=False)
+  dp_out, back_out = run_dp(adj, dp, back, seqs, cost_matrix)
   chex.assert_shape(dp_out, (3, n_states))
   chex.assert_shape(back_out, (3, n_states, 4))
   # Leaves should have 0 at their observed state
