@@ -49,7 +49,7 @@ def mutate(
   return mutated_sequences.astype(jnp.int8)
 
 
-def _generate_tree_recursive(  # noqa: PLR0913
+def _generate_tree_recursive(
   key: PRNGKeyArray,
   parent_seq: EvoSequence,
   current_depth: int,

@@ -1,6 +1,7 @@
+"""Configurations for the SVM tree model and experiments."""
+
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
 
 
 class ModelType(Enum):
@@ -9,6 +10,7 @@ class ModelType(Enum):
     BASE_TREE = "base_tree"
     SINGLE_SVM = "single_svm"
     LEARNABLE_HIERARCHICAL_SVM = "learnable_hierarchical_svm"
+    HIERARCHICAL_SVM = "hierarchical_svm"
 
 
 @dataclass
@@ -16,16 +18,29 @@ class DataConfig:
     """Configuration for data loading."""
 
     batch_size: int = 128
-    train_subset_size: Optional[int] = None
-    test_subset_size: Optional[int] = None
+    train_subset_size: int | None = None
+    test_subset_size: int | None = None
 
 
 @dataclass
-class ModelConfig:
-    """Configuration for the model."""
+class BaseModelConfig:
+    """Base configuration for a model."""
 
     in_features: int = 28 * 28
     model_type: ModelType = ModelType.BASE_TREE
+
+
+@dataclass
+class HierarchicalSVMModelConfig(BaseModelConfig):
+    """Configuration for the HierarchicalSVM model."""
+
+    model_type: ModelType = ModelType.HIERARCHICAL_SVM
+    depth: int = 2
+    num_classes: int = 10
+
+
+ModelConfig = BaseModelConfig | HierarchicalSVMModelConfig
+
 
 @dataclass
 class TrainConfig:
@@ -52,7 +67,17 @@ class MNISTConfig:
     """Top-level configuration for the MNIST experiment."""
 
     data: DataConfig = field(default_factory=DataConfig)
-    model: ModelConfig = field(default_factory=ModelConfig)
+    model: BaseModelConfig = field(default_factory=BaseModelConfig)
+    train: TrainConfig = field(default_factory=TrainConfig)
+    wandb: WandbConfig = field(default_factory=WandbConfig)
+
+
+@dataclass
+class HierarchicalSVMConfig:
+    """Top-level configuration for the HierarchicalSVM experiment."""
+
+    data: DataConfig = field(default_factory=DataConfig)
+    model: HierarchicalSVMModelConfig = field(default_factory=HierarchicalSVMModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
 

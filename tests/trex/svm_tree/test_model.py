@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import pytest
+
 from trex.svm_tree.model import LearnableTreeModel
 
 
@@ -37,7 +38,7 @@ def test_learnable_tree_model_forward_pass(model):
 
     assert output.shape == (3,), "Output shape should match the number of classes."
     assert jnp.allclose(
-        jnp.sum(output), 1.0
+        jnp.sum(output), 1.0,
     ), "Output should be a probability distribution summing to 1."
 
 
