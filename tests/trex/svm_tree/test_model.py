@@ -14,7 +14,7 @@ def model_key():
 @pytest.fixture
 def model(model_key):
     """Provides an instance of the LearnableTreeModel."""
-    return LearnableTreeModel(in_features=10, num_classes=3, key=model_key)
+    return LearnableTreeModel(in_features=10, num_classes=3, n_ancestors=2, key=model_key)
 
 
 def test_learnable_tree_model_init(model):
