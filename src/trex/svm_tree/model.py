@@ -27,7 +27,7 @@ class LearnableHierarchicalSVM(eqx.Module):
     self,
     in_features: int,
     num_classes: int,
-    n_nodes: int = 64,
+    n_ancestors: int,
     *,
     key: "jax.random.PRNGKey",
     sparsity_regularization_strength: float = 0.01,
@@ -35,7 +35,7 @@ class LearnableHierarchicalSVM(eqx.Module):
   ):
     self.num_classes = num_classes
     self.n_leaves = num_classes
-    self.n_ancestors = n_nodes - num_classes
+    self.n_ancestors = n_ancestors
     self.in_features = in_features
     self.n_total = self.n_leaves + self.n_ancestors
 
@@ -128,6 +128,7 @@ class LearnableTreeModel(eqx.Module):
     self,
     in_features: int,
     num_classes: int,
+    n_ancestors: int,
     *,
     key: "jax.random.PRNGKey",
     sparsity_regularization_strength: float = 0.01,
@@ -138,6 +139,7 @@ class LearnableTreeModel(eqx.Module):
     Args:
         in_features: The number of input features.
         num_classes: The number of output classes.
+        n_ancestors: The number of ancestor nodes.
         key: A JAX PRNG key for initializing the SVMs and topology.
         sparsity_regularization_strength: The strength of the L1 sparsity penalty.
         graph_constraint_scale: The scaling factor for the graph constraint loss.
@@ -145,7 +147,7 @@ class LearnableTreeModel(eqx.Module):
     """
     self.num_classes = num_classes
     self.n_leaves = num_classes
-    self.n_ancestors = num_classes - 1
+    self.n_ancestors = n_ancestors
     self.in_features = in_features
 
     svm_key, topo_key = jax.random.split(key)

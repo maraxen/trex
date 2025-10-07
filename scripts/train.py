@@ -255,6 +255,7 @@ def main(
     model = LearnableHierarchicalSVM(
       in_features=cfg.model.in_features,
       num_classes=10,
+      n_ancestors=cfg.model.n_ancestors,
       key=model_key,
       sparsity_regularization_strength=cfg.model.sparsity_regularization_strength,
       graph_constraint_scale=cfg.model.graph_constraint_scale,
@@ -263,6 +264,7 @@ def main(
     model = LearnableTreeModel(
       in_features=cfg.model.in_features,
       num_classes=10,
+      n_ancestors=cfg.model.n_ancestors,
       key=model_key,
       sparsity_regularization_strength=cfg.model.sparsity_regularization_strength,
       graph_constraint_scale=cfg.model.graph_constraint_scale,
