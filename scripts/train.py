@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from trex.svm_tree.configs import (
+    DynamicHierarchicalSVMConfig,
     HierarchicalSVMConfig,
     LearnableHierarchicalSVMConfig,
     LearnableMNISTConfig,
@@ -26,6 +27,7 @@ from trex.svm_tree.configs import (
     ModelType,
 )
 from trex.svm_tree.data_utils import get_mnist_dataloaders
+from trex.svm_tree.dynamic_model import DynamicHierarchicalSVM
 from trex.svm_tree.hierarchical_model import HierarchicalSVM
 from trex.svm_tree.model import (
     BaseTreeModel,
@@ -33,6 +35,7 @@ from trex.svm_tree.model import (
     LearnableTreeModel,
     OvR_SVM_Model,
 )
+from trex.tree import enforce_graph_constraints
 
 # JAX configuration
 config.update("jax_debug_nans", True)  # ruff: noqa: FBT003
@@ -43,6 +46,7 @@ ConfigType = (
     | LearnableMNISTConfig
     | LearnableHierarchicalSVMConfig
     | HierarchicalSVMConfig
+    | DynamicHierarchicalSVMConfig
 )
 
 
@@ -51,7 +55,7 @@ ConfigType = (
 # -------------------
 
 
-def call_model_with_key(model: eqx.Module, x: jax.Array, key: jax.Array) -> jax.Array:
+def call_model_with_key(model: eqx.Module, x: jax.Array, key: jax.Array) -> Any:
     """Call a model's __call__ method with a key."""
     return model(x, key=key)
 
@@ -69,21 +73,35 @@ def loss_fn(
 
     This function is pure and is called from within the JIT-compiled train_step.
     """
+    topo_loss = 0.0
+
     # --- Differentiable model call ---
-    # For models with stochastic components, we need a unique key per sample.
-    if isinstance(model, (LearnableTreeModel, LearnableHierarchicalSVM)):
+    if isinstance(model, DynamicHierarchicalSVM):
+        keys = jax.random.split(key, x.shape[0])
+        # vmap the model over the batch dimension
+        pred_y_batched, (adj_left_batch, adj_right_batch) = jax.vmap(
+            call_model_with_key, in_axes=(None, 0, 0)
+        )(model, x, keys)
+
+        if use_topo_loss:
+            # Graph constraint loss for both adjacency matrices, vmapped over batch
+            graph_loss_left = jax.vmap(enforce_graph_constraints)(adj_left_batch)
+            graph_loss_right = jax.vmap(enforce_graph_constraints)(adj_right_batch)
+            topo_loss = jnp.mean(graph_loss_left + graph_loss_right)
+
+    elif isinstance(model, (LearnableTreeModel, LearnableHierarchicalSVM)):
         keys = jax.random.split(key, x.shape[0])
         pred_y_batched = jax.vmap(call_model_with_key, in_axes=(None, 0, 0))(
             model,
             x,
             keys,
         )
-        # --- Topology loss for learnable tree structures ---
-        adj = model.topology(key)
-        topo_loss = model.loss(adj)
+        if use_topo_loss:
+            # --- Topology loss for learnable tree structures ---
+            adj = model.topology(key)
+            topo_loss = model.loss(adj)
     else:
         pred_y_batched = jax.vmap(model)(x)
-        topo_loss = 0.0
 
     # --- Supervised classification loss ---
     ce_loss = optax.softmax_cross_entropy_with_integer_labels(
@@ -141,8 +159,12 @@ def eval_step(
     key: jax.random.PRNGKey,
 ) -> tuple[jax.Array, jax.Array]:
     """Compute accuracy and predictions on a batch of data."""
-    # For models with stochastic components (like LearnableTreeModel).
-    if isinstance(model, (LearnableTreeModel, LearnableHierarchicalSVM)):
+    if isinstance(model, DynamicHierarchicalSVM):
+        keys = jax.random.split(key, x.shape[0])
+        pred_y, _ = jax.vmap(call_model_with_key, in_axes=(None, 0, 0))(
+            model, x, keys
+        )
+    elif isinstance(model, (LearnableTreeModel, LearnableHierarchicalSVM)):
         keys = jax.random.split(key, x.shape[0])
         pred_y = jax.vmap(call_model_with_key, in_axes=(None, 0, 0))(model, x, keys)
     else:
@@ -247,6 +269,14 @@ def evaluate_model(
 
 def create_model(cfg: ConfigType, key: jax.Array) -> eqx.Module:
     """Create the model based on the configuration."""
+    if isinstance(cfg, DynamicHierarchicalSVMConfig):
+        return DynamicHierarchicalSVM(
+            depth=cfg.model.depth,
+            in_features=cfg.model.in_features,
+            num_classes=cfg.model.num_classes,
+            embedding_dim=cfg.model.embedding_dim,
+            key=key,
+        )
     if isinstance(cfg, LearnableHierarchicalSVMConfig):
         return LearnableHierarchicalSVM(
             in_features=cfg.model.in_features,
@@ -297,9 +327,25 @@ def log_wandb_data(
     all_preds: np.ndarray,
     all_labels: np.ndarray,
     num_epochs: int,
+    test_loader: DataLoader,
 ) -> None:
     """Log data to Weights & Biases."""
-    if isinstance(model, (LearnableHierarchicalSVM, LearnableTreeModel)):
+    if isinstance(model, DynamicHierarchicalSVM):
+        # For the dynamic model, we visualize the topology for one sample.
+        viz_key, _ = jax.random.split(eval_key)
+        x_sample, _ = next(iter(data_stream(test_loader)))
+        x_sample = x_sample[0:1]  # Take a single sample
+        _, (adj_left, adj_right) = model(x_sample, key=viz_key)
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 10))
+        ax1.imshow(np.array(adj_left[0]), cmap="hot", interpolation="nearest")
+        ax1.set_title(f"Left Adjacency - Epoch {log_data['epoch'] + 1}")
+        ax2.imshow(np.array(adj_right[0]), cmap="hot", interpolation="nearest")
+        ax2.set_title(f"Right Adjacency - Epoch {log_data['epoch'] + 1}")
+        log_data["dynamic_adjacency"] = wandb.Image(fig)
+        plt.close()
+
+    elif isinstance(model, (LearnableHierarchicalSVM, LearnableTreeModel)):
         adj_key, _ = jax.random.split(eval_key)
         adj = model.topology(adj_key)
         plt.figure(figsize=(10, 10))
@@ -326,7 +372,9 @@ def main(cfg: ConfigType) -> None:
     """Run the main training and evaluation loop."""
     if cfg.wandb.use_wandb:
         run_name = cfg.wandb.run_name
-        if isinstance(cfg, LearnableHierarchicalSVMConfig):
+        if isinstance(cfg, DynamicHierarchicalSVMConfig):
+            run_name = "dynamic-hierarchical-svm"
+        elif isinstance(cfg, LearnableHierarchicalSVMConfig):
             run_name = "learnable-hierarchical-svm"
         elif isinstance(cfg, LearnableMNISTConfig):
             run_name = "learnable-tree"
@@ -355,7 +403,12 @@ def main(cfg: ConfigType) -> None:
     # --- Model and Optimizer Initialization ---
     model = create_model(cfg, model_key)
     use_topo_loss = isinstance(
-        cfg, (LearnableMNISTConfig, LearnableHierarchicalSVMConfig)
+        cfg,
+        (
+            LearnableMNISTConfig,
+            LearnableHierarchicalSVMConfig,
+            DynamicHierarchicalSVMConfig,
+        ),
     )
     topology_loss_weight = cfg.train.topology_loss_weight
 
@@ -398,6 +451,7 @@ def main(cfg: ConfigType) -> None:
                 all_preds,
                 all_labels,
                 cfg.train.num_epochs,
+                test_loader,
             )
 
     print("Training finished.")
@@ -417,6 +471,7 @@ if __name__ == "__main__":
         "learnable-tree": LearnableMNISTConfig(),
         "learnable-hierarchical-svm": LearnableHierarchicalSVMConfig(),
         "hierarchical-svm": HierarchicalSVMConfig(),
+        "dynamic-hierarchical-svm": DynamicHierarchicalSVMConfig(),
     }
     Subcommands = tyro.extras.subcommand_type_from_defaults(COMMAND_DEFAULTS)
 

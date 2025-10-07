@@ -11,6 +11,7 @@ class ModelType(Enum):
     SINGLE_SVM = "single_svm"
     LEARNABLE_HIERARCHICAL_SVM = "learnable_hierarchical_svm"
     HIERARCHICAL_SVM = "hierarchical_svm"
+    DYNAMIC_HIERARCHICAL_SVM = "dynamic_hierarchical_svm"
 
 
 @dataclass
@@ -98,6 +99,28 @@ class LearnableMNISTConfig:
 
     data: DataConfig = field(default_factory=DataConfig)
     model: LearnableModelConfig = field(default_factory=LearnableModelConfig)
+    train: TrainConfig = field(default_factory=TrainConfig)
+    wandb: WandbConfig = field(default_factory=WandbConfig)
+
+
+@dataclass
+class DynamicHierarchicalSVMModelConfig(BaseModelConfig):
+    """Configuration for the DynamicHierarchicalSVM model."""
+
+    model_type: ModelType = ModelType.DYNAMIC_HIERARCHICAL_SVM
+    depth: int = 2
+    num_classes: int = 10
+    embedding_dim: int = 64
+
+
+@dataclass
+class DynamicHierarchicalSVMConfig:
+    """Top-level configuration for the DynamicHierarchicalSVM experiment."""
+
+    data: DataConfig = field(default_factory=DataConfig)
+    model: DynamicHierarchicalSVMModelConfig = field(
+        default_factory=DynamicHierarchicalSVMModelConfig
+    )
     train: TrainConfig = field(default_factory=TrainConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
 
