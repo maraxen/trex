@@ -89,7 +89,6 @@ class LearnableModelConfig:
     in_features: int = 28 * 28
     sparsity_regularization_strength: float = 0.01
     graph_constraint_scale: float = 10.0
-    n_ancestors: int = 2
 
 
 @dataclass
