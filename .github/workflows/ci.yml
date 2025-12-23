@@ -25,9 +25,9 @@ jobs:
       - name: Create venv
         run: uv venv
       - name: Install dependencies
-        run: uv pip install ".[dev]"
-      - name: Run pyright
-        run: uv run pyright
+        run: uv pip install ".[dev]" ty
+      - name: Run ty
+        run: uv run ty check src/
 
   test:
     runs-on: ubuntu-latest
