@@ -40,56 +40,65 @@ def create_nk_model_landscape(n: int, k: int, key: Array, n_states: int = 2) -> 
 
 
 def get_fitness(sequence: EvoSequence, landscape: PyTree) -> Float:
-  """Calculate the fitness of a sequence on a given landscape.
+  r"""Calculate the fitness of a sequence on a given landscape.
+
+  This function uses vectorized advanced indexing to avoid explicit loops or vmap
+  over sites, significantly improving compilation time and performance for large L.
+
+  Process:
+  1.  **Index Creation**: Construct indices for all interacting sites.
+      -   `self_indices`: Shape $(N, 1)$. Indices of the sites themselves.
+      -   `interactions`: Shape $(N, K)$. Indices of epistatic partners.
+      -   `gather_indices`: Shape $(N, K+1)$. Concatenation of self and partner indices.
+  2.  **State Gathering**: Retrieve the state values for all interacting sites.
+      -   `gathered_states`: Shape $(N, K+1)$. Values from `sequence` at `gather_indices`.
+  3.  **Table Index Computation**: Convert state combinations to integer indices.
+      -   `powers`: Shape $(K+1,)$. Powers of $q$ ($q^0, q^1, \\dots, q^K$).
+      -   `table_indices`: Shape $(N,)$. computed as $\\sum s_j q^j$.
+  4.  **Fitness Lookup**: Retrieve fitness values from the table.
+      -   `fitness_values`: Shape $(N,)$. Values from `fitness_tables` at `table_indices`.
+  5.  **Aggregation**: Compute the mean fitness.
+
+  Notes:
+  The fitness $F(\\sigma)$ is defined as:
+  $$ F(\\sigma) = \\frac{1}{N} \\sum_{i=0}^{N-1} f_i(\\sigma_i, \\sigma_{i_1}, \\dots, \\sigma_{i_K}) $$
+
+  where $ (i_1, \\dots, i_K) $ are the epistatic partners of site $ i $.
+  We compute the index for the fitness table $ f_i $ as:
+  $$ \\text{index}_i = \\sum_{j=0}^{K} s_j \\cdot q^j $$
+  where $ s_0 = \\sigma_i $ and $ s_{1\\dots K} $ are the states of the interacting sites.
 
   Args:
-      sequence: The sequence to evaluate.
-      landscape: The fitness landscape.
+      sequence: The sequence to evaluate (Shape: (N,)).
+      landscape: The fitness landscape containing 'interactions' and 'fitness_tables'.
 
   Returns:
-      The fitness of the sequence.
+      The mean fitness of the sequence.
 
   """
+  n_sites = sequence.shape[0]
+  interactions = landscape["interactions"]
   n_states = landscape["n_states"]
-  # k = landscape["k"] # Not strictly needed if we trust the table size, but good for clarity if needed
 
-  def site_fitness_contribution(
-    i: jax.Array,
-    seq: EvoSequence,
-    interactions: Array,
-    fitness_tables: Array,
-  ) -> Float:
-    interacting_sites = jnp.append(jnp.array([i]), interactions[i])
-    interacting_states = seq[interacting_sites]
+  self_indices = jnp.arange(n_sites)[:, None]
+  gather_indices = jnp.concatenate([self_indices, interactions], axis=1)
 
-    # Calculate index in base-q: sum(state[j] * q^j)
-    powers = n_states ** jnp.arange(len(interacting_states))
-    index = jnp.sum(interacting_states * powers)
+  gathered_states = sequence[gather_indices]
 
-    return fitness_tables[i, index]
+  k = interactions.shape[1]
+  powers = n_states ** jnp.arange(k + 1)
 
-  # Vectorize the site fitness contribution function over all sites
-  vectorized_site_fitness = jax.vmap(
-    site_fitness_contribution,
-    in_axes=(0, None, None, None),
-  )
+  table_indices = jnp.dot(gathered_states, powers)
 
-  # Calculate the fitness contributions for all sites
-  all_site_fitness = vectorized_site_fitness(
-    jnp.arange(len(sequence)),
-    sequence,
-    landscape["interactions"],
-    landscape["fitness_tables"],
-  )
+  fitness_values = landscape["fitness_tables"][jnp.arange(n_sites), table_indices]
 
-  # Return the mean fitness
-  return jnp.mean(all_site_fitness)
+  return jnp.mean(fitness_values)
 
 
 batched_get_fitness = jax.vmap(get_fitness, in_axes=(0, None))
 
 
-def generate_tree_data(
+def generate_tree_data(  # noqa: PLR0915
   landscape: PyTree,
   adjacency: Array,
   root_sequence: EvoSequence,
@@ -235,10 +244,10 @@ def generate_tree_data(
   )
 
   # Masked sequences are not needed for this part of the task
-  masked_sequences = jnp.zeros_like(all_sequences, dtype=jnp.bfloat16)
+  masked_sequences = jnp.zeros_like(all_sequences, dtype=jnp.float32)
 
   return PhylogeneticTree(
     masked_sequences=masked_sequences,
-    all_sequences=all_sequences.astype(jnp.bfloat16),
-    adjacency=adjacency.astype(jnp.bfloat16),
+    all_sequences=all_sequences.astype(jnp.float32),
+    adjacency=adjacency.astype(jnp.float32),
   )

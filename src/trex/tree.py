@@ -154,15 +154,48 @@ def compute_surrogate_cost(
   sequences: jnp.ndarray,  # (n_nodes, seq_len, n_states)
   adjacency: jnp.ndarray,  # (n_nodes, n_nodes)
 ) -> jnp.ndarray:
-  """Compute a differentiable surrogate for the tree traversal cost.
+  r"""Compute a differentiable surrogate for the tree traversal cost.
 
-  This version is the direct differentiable analog of the parsimony score,
+  This version uses arithmetic expansion to avoid large intermediate tensors.
+
+  Process:
+  1.  **Self-Energy**: Compute squared sum of sequences.
+      -   `self_energy`: Shape $(N,)$. Computed as $\\sum S^2$.
+  2.  **Cross-Term**: Compute pairwise dot products.
+      -   `flat_S`: Shape $(N, L \\cdot Q)$. Flattened sequences.
+      -   `pair_interactions`: Shape $(N, N)$. Computed as $S S^T$.
+  3.  **Combination**: Combine terms with adjacency weights.
+      -   `term1`: Weight by child node self-energy (sum over j).
+      -   `term2`: Weight by parent node self-energy (sum over i).
+      -   `term3`: Subtract weighted cross-terms.
+
+  Notes:
+  $$ \\text{Cost} = \\frac{1}{2} \\sum_{i,j} A_{ij} ||S_i - S_j||^2 $$
+  $$ = \\frac{1}{2} \\sum_{i,j} A_{ij} (S_i^2 + S_j^2 - 2 S_i S_j) $$
+  $$ = \\sum_i D_i S_i^2 - \\sum_{i,j} A_{ij} S_i S_j $$
+
+  where $D_i = \\sum_j A_{ij}$ (if undirected). For directed adjacency where columns sum to 1,
+  the terms are weighted differently, but the decomposition holds.
+
+  Args:
+      sequences: Sequence probabilities (N, L, Q).
+      adjacency: Tree structure (N, N).
+
+  Returns:
+      Scalar surrogate cost.
+
   """
-  diff = sequences[:, jnp.newaxis, ...] - sequences[jnp.newaxis, :, ...]
+  self_energy = jnp.sum(sequences**2, axis=(-1, -2))
 
-  squared_distance = jnp.sum(diff**2, axis=(-1, -2))
+  flat_s = sequences.reshape(sequences.shape[0], -1)
 
-  return jnp.sum(squared_distance * adjacency) / 2
+  pair_interactions = flat_s @ flat_s.T
+
+  term1 = jnp.sum(adjacency * self_energy[:, None])
+  term2 = jnp.sum(adjacency * self_energy[None, :])
+  term3 = -2 * jnp.sum(adjacency * pair_interactions)
+
+  return (term1 + term2 + term3) / 2
 
 
 @jax.jit
@@ -171,41 +204,55 @@ def compute_soft_cost(
   adjacency: jnp.ndarray,  # (n_nodes, n_nodes)
   cost_matrix: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
-  """Compute a soft evolutionary cost using weighted squared distance.
+  r"""Compute a soft evolutionary cost using weighted squared distance.
 
-  Computes: sum_{edges (i,j)} sum_l (S_i[l] - S_j[l])^T @ C @ (S_i[l] - S_j[l])
+  This implementation minimizes memory usage by expanding the quadratic form.
 
-  This is equivalent to compute_surrogate_cost when C = I (identity), and
-  matches Sankoff's cost semantics when sequences are one-hot (discrete).
+  Process:
+  1.  **Weighting**: Precompute weighted sequences $W$.
+      -   `weighted_seqs`: Shape $(N, L, Q)$. $W = S C$ (or elementwise if C is diagonal).
+  2.  **Self-Energy**: Compute self-interaction terms.
+      -   `self_energy`: Shape $(N,)$. $\\sum S \\odot W$.
+  3.  **Cross-Term**: Compute pairwise weighted interactions.
+      -   `pair_interactions`: Shape $(N, N)$. $S W^T$. Flattened over $L, Q$.
+  4.  **Combination**: Combine using adjacency weights.
+      -   Sum weighted self-energies and subtract cross-terms.
+
+  Notes:
+  Computes:
+  $$ \\text{Cost} = \\frac{1}{2} \\sum_{i,j} A_{ij} (S_i - S_j)^T C (S_i - S_j) $$
+
+  Expands to:
+  $$ S_i^T C S_i + S_j^T C S_j - 2 S_i^T C S_j $$
 
   Args:
-      sequences: Sequence probabilities or one-hot vectors. Shape (N, L, Q).
-      adjacency: Tree structure. Shape (N, N).
-      cost_matrix: Substitution cost matrix. Shape (Q, Q).
-                   Defaults to Identity (standard squared Euclidean distance).
+      sequences: Sequence probabilities (N, L, Q).
+      adjacency: Tree structure (N, N).
+      cost_matrix: Substitution cost matrix (Q, Q) or (Q,) for diagonal.
 
   Returns:
       Scalar cost value.
 
   """
-  n_states = sequences.shape[-1]
   if cost_matrix is None:
-    cost_matrix = jnp.eye(n_states)
+    weighted_seqs = sequences
+  elif cost_matrix.ndim == 1:
+    weighted_seqs = sequences * cost_matrix
+  else:
+    weighted_seqs = sequences @ cost_matrix
 
-  # Compute pairwise differences: diff[i,j,l,q] = S_i[l,q] - S_j[l,q]
-  # Shape: (N, N, L, Q)
-  diff = sequences[:, jnp.newaxis, :, :] - sequences[jnp.newaxis, :, :, :]
+  self_energy = jnp.sum(sequences * weighted_seqs, axis=(-1, -2))
 
-  # Apply cost matrix: diff @ C -> (N, N, L, Q)
-  weighted_diff = diff @ cost_matrix
+  flat_s = sequences.reshape(sequences.shape[0], -1)
+  flat_w = weighted_seqs.reshape(sequences.shape[0], -1)
 
-  # Compute quadratic form: sum over q of diff * weighted_diff
-  # Then sum over positions l, weighted by adjacency
-  # cost_per_edge[i,j] = sum_l sum_q diff[i,j,l,q] * weighted_diff[i,j,l,q]
-  cost_per_edge = jnp.sum(diff * weighted_diff, axis=(-1, -2))
+  pair_interactions = flat_s @ flat_w.T
 
-  # Weight by adjacency and sum (divide by 2 for undirected edges)
-  return jnp.sum(cost_per_edge * adjacency) / 2
+  term1 = jnp.sum(adjacency * self_energy[:, None])
+  term2 = jnp.sum(adjacency * self_energy[None, :])
+  term3 = -2 * jnp.sum(adjacency * pair_interactions)
+
+  return (term1 + term2 + term3) / 2
 
 
 @jax.jit
@@ -242,7 +289,7 @@ def compute_loss(
   key: PRNGKeyArray,
   params: dict[str, Array | list[Array]],
   sequences: BatchEvoSequence,
-  metadata: GroundTruthMetadata,
+  _metadata: GroundTruthMetadata,
   temperature: float,
   adjacency: jax.Array,
   *,
@@ -260,11 +307,12 @@ def compute_loss(
   """Compute the total loss for optimizing tree and/or sequences.
 
   Args:
+      key: JAX random key.
       params: Trainable parameters for the tree and sequences.
       sequences: The initial sequences (leaves are fixed).
-      metadata: Dictionary containing metadata.
+      _metadata: Dictionary containing metadata (unused).
       temperature: Temperature for softmax and loss scaling.
-      epoch: The current training epoch.
+      adjacency: The tree adjacency matrix.
       graph_constraint_scale: Scaling factor for the tree constraint loss.
       verbose: If True, returns a detailed breakdown of the loss components.
       fix_seqs: If True, do not update sequences (only update tree).
