@@ -10,25 +10,33 @@ from .utils.types import (
 )
 
 
-def create_nk_model_landscape(n: int, k: int, key: Array) -> PyTree:
+def create_nk_model_landscape(n: int, k: int, key: Array, n_states: int = 2) -> PyTree:
   """Create a random fitness landscape for an NK model.
 
   Args:
       n: The length of the sequence.
       k: The number of epistatic interactions.
       key: A JAX random key.
+      n_states: The alphabet size (q).
 
   Returns:
       A PyTree representing the fitness landscape.
+      Contains 'interactions' (N, K) and 'fitness_tables' (N, q, q, ..., q) flattened.
 
   """
   key, subkey = jax.random.split(key)
   interactions = jax.random.randint(subkey, (n, k), 0, n)
 
   key, subkey = jax.random.split(key)
-  fitness_tables = jax.random.uniform(subkey, (n, 2 ** (k + 1)))
+  # The table size for each site is q^(k+1)
+  fitness_tables = jax.random.uniform(subkey, (n, n_states ** (k + 1)))
 
-  return {"interactions": interactions, "fitness_tables": fitness_tables}
+  return {
+    "interactions": interactions,
+    "fitness_tables": fitness_tables,
+    "n_states": n_states,
+    "k": k,
+  }
 
 
 def get_fitness(sequence: EvoSequence, landscape: PyTree) -> Float:
@@ -42,6 +50,8 @@ def get_fitness(sequence: EvoSequence, landscape: PyTree) -> Float:
       The fitness of the sequence.
 
   """
+  n_states = landscape["n_states"]
+  # k = landscape["k"] # Not strictly needed if we trust the table size, but good for clarity if needed
 
   def site_fitness_contribution(
     i: jax.Array,
@@ -51,7 +61,11 @@ def get_fitness(sequence: EvoSequence, landscape: PyTree) -> Float:
   ) -> Float:
     interacting_sites = jnp.append(jnp.array([i]), interactions[i])
     interacting_states = seq[interacting_sites]
-    index = jnp.sum(interacting_states * (2 ** jnp.arange(len(interacting_states))))
+
+    # Calculate index in base-q: sum(state[j] * q^j)
+    powers = n_states ** jnp.arange(len(interacting_states))
+    index = jnp.sum(interacting_states * powers)
+
     return fitness_tables[i, index]
 
   # Vectorize the site fitness contribution function over all sites
@@ -82,6 +96,7 @@ def generate_tree_data(
   mutation_rate: float,
   key: Array,
   coupled_mutation_prob: float = 0.5,
+  n_states: int = 20,
 ) -> PhylogeneticTree:
   """Generate a tree of sequences using the NK model.
 
@@ -92,6 +107,7 @@ def generate_tree_data(
       mutation_rate: The probability of a mutation at each site.
       key: A JAX random key.
       coupled_mutation_prob: The probability of performing a coupled mutation.
+      n_states: The alphabet size for mutations. Should match the landscape's n_states.
 
   Returns:
       A PhylogeneticTree object containing the generated sequences.
@@ -99,6 +115,12 @@ def generate_tree_data(
   """
   n_nodes = adjacency.shape[0]
   seq_length = len(root_sequence)
+
+  # Ensure input n_states matches landscape if present
+  # (Fallback for backward compatibility or loose dicts)
+  if "n_states" in landscape:
+    # We cast to int to avoid JAX/numpy scalar issues if it's an array
+    n_states = int(landscape["n_states"])
 
   # Get the topological sort of the nodes using a breadth-first search (BFS)
   parent_indices = jnp.argmax(adjacency, axis=1)
@@ -155,7 +177,7 @@ def generate_tree_data(
         key, subkey = jax.random.split(key)
         mutation_mask = jax.random.bernoulli(subkey, mutation_rate, (seq_length,))
         key, subkey = jax.random.split(key)
-        new_values = jax.random.randint(subkey, (seq_length,), 0, 20)
+        new_values = jax.random.randint(subkey, (seq_length,), 0, n_states)
         return jnp.where(
           mutation_mask,
           new_values,
@@ -171,7 +193,7 @@ def generate_tree_data(
 
         mutation_mask = jnp.zeros_like(parent_sequence, dtype=bool).at[sites_to_mutate].set(True)
 
-        new_values = jax.random.randint(subkey2, (seq_length,), 0, 20)
+        new_values = jax.random.randint(subkey2, (seq_length,), 0, n_states)
         return jnp.where(
           mutation_mask,
           new_values,

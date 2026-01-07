@@ -22,11 +22,285 @@ from jaxtyping import PRNGKeyArray, PyTree
 
 from trex.nk_model import create_nk_model_landscape, generate_tree_data
 from trex.sankoff import run_sankoff
-from trex.tree import compute_loss, compute_surrogate_cost, update_seq
+from trex.tree import compute_loss, compute_surrogate_cost, update_seq, compute_soft_cost
 from trex.utils.types import (
   EvoSequence,
   OneHotEvoSequence,
 )
+
+
+# ============================================================================
+# Optimizer Factory and Configurable TREX Optimization
+# ============================================================================
+
+
+def create_optimizer(
+  name: str,
+  learning_rate: float,
+  use_gradient_clipping: bool = True,
+) -> optax.GradientTransformation:
+  """Create an optimizer by name with optional gradient clipping.
+
+  Args:
+      name: One of "adam", "sgd", "rmsprop", "adamw"
+      learning_rate: Learning rate for the optimizer
+      use_gradient_clipping: Whether to apply gradient clipping (default: True)
+
+  Returns:
+      An optax GradientTransformation
+  """
+  optimizers = {
+    "adam": optax.adam(learning_rate),
+    "sgd": optax.sgd(learning_rate, momentum=0.9),
+    "rmsprop": optax.rmsprop(learning_rate),
+    "adamw": optax.adamw(learning_rate, weight_decay=0.01),
+  }
+
+  if name not in optimizers:
+    raise ValueError(f"Unknown optimizer: {name}. Choose from {list(optimizers.keys())}")
+
+  base_optimizer = optimizers[name]
+
+  if use_gradient_clipping:
+    return optax.chain(optax.clip_by_global_norm(1.0), base_optimizer)
+  return base_optimizer
+
+
+def run_trex_optimization_configurable(
+  leaf_sequences: jax.Array,
+  n_all: int,
+  n_leaves: int,
+  n_states: int,
+  adj_matrix: jax.Array,
+  key: PRNGKeyArray,
+  use_soft_cost: bool = False,
+  optimizer_name: str = "adam",
+  learning_rate: float = 1e-3,
+  n_iterations: int = 10000,
+  return_losses: bool = False,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+  """Run TREX optimization with configurable hyperparameters.
+
+  This version uses jax.lax.scan for efficient metric accumulation when
+  return_losses=True, following JAX best practices for performance.
+
+  Args:
+      leaf_sequences: Observed sequences at leaves. Shape: (n_leaves, seq_len)
+      n_all: Total number of nodes in the tree
+      n_leaves: Number of leaf nodes
+      n_states: Alphabet size (e.g., 2 for binary, 20 for amino acids)
+      adj_matrix: Adjacency matrix representing tree structure
+      key: JAX random key
+      use_soft_cost: If True, use compute_soft_cost; else use compute_surrogate_cost
+      optimizer_name: One of "adam", "sgd", "rmsprop", "adamw"
+      learning_rate: Learning rate for optimization
+      n_iterations: Number of optimization iterations
+      return_losses: If True, also return the loss curve
+
+  Returns:
+      If return_losses=False: Reconstructed ancestor sequences (n_ancestors, seq_len)
+      If return_losses=True: Tuple of (ancestors, loss_curve) where loss_curve
+          has shape (n_iterations,)
+  """
+  key, subkey = jax.random.split(key)
+  seq_len = leaf_sequences.shape[1]
+
+  # Initialize parameters
+  params = {
+    "tree_params": adj_matrix,
+    "ancestors": [jax.random.normal(subkey, (seq_len, n_states)) for _ in range(n_all - n_leaves)],
+  }
+
+  # Create optimizer
+  optimizer = create_optimizer(optimizer_name, learning_rate)
+  opt_state = optimizer.init(params)
+
+  # One-hot encode leaf sequences
+  leaf_sequences_one_hot = jax.nn.one_hot(leaf_sequences, n_states)
+
+  # Create masked sequence array (ancestors initialized to zero)
+  masked_sequences = jnp.concatenate(
+    [
+      leaf_sequences_one_hot,
+      jnp.zeros((n_all - n_leaves, seq_len, n_states)),
+    ],
+    axis=0,
+  ).astype(jnp.float32)
+
+  # Pre-compute identity cost matrix for soft cost
+  identity_cost_matrix = jnp.eye(n_states, dtype=jnp.float32)
+
+  # Select appropriate loss function
+  if use_soft_cost:
+
+    @jax.jit
+    def loss_fn(params):
+      updated_sequences = update_seq(params, masked_sequences, 1.0)
+      return compute_soft_cost(updated_sequences, adj_matrix, cost_matrix=identity_cost_matrix)
+  else:
+
+    @jax.jit
+    def loss_fn(params):
+      updated_sequences = update_seq(params, masked_sequences, 1.0)
+      return compute_surrogate_cost(updated_sequences, adj_matrix)
+
+  loss_and_grad = jax.value_and_grad(loss_fn)
+
+  if return_losses:
+    # Use jax.lax.scan for efficient loss accumulation
+    def scan_step(carry, _):
+      params, opt_state = carry
+      loss, grads = loss_and_grad(params)
+      updates, opt_state = optimizer.update(grads, opt_state, params)
+      params = cast(
+        "dict[str, jax.Array | list[jax.Array]]",
+        optax.apply_updates(params, updates),
+      )
+      return (params, opt_state), loss
+
+    (params, _), losses = jax.lax.scan(
+      scan_step,
+      (params, opt_state),
+      None,
+      length=n_iterations,
+    )
+
+    ancestors = jnp.argmax(jnp.stack(params["ancestors"]), axis=-1)
+    return ancestors, losses
+
+  else:
+    # Use fori_loop when losses not needed (slightly more memory efficient)
+    def training_step(i, carry):
+      params, opt_state = carry
+      _, grads = loss_and_grad(params)
+      updates, opt_state = optimizer.update(grads, opt_state, params)
+      params = cast(
+        "dict[str, jax.Array | list[jax.Array]]",
+        optax.apply_updates(params, updates),
+      )
+      return params, opt_state
+
+    params, _ = jax.lax.fori_loop(
+      0,
+      n_iterations,
+      training_step,
+      (params, opt_state),
+    )
+
+    return jnp.argmax(jnp.stack(params["ancestors"]), axis=-1)
+
+
+# ============================================================================
+# Batched/Vmap-Compatible TREX Optimization
+# ============================================================================
+
+
+def _update_seq_stacked(
+  ancestors: jax.Array,
+  sequences: jax.Array,
+  n_leaves: int,
+  temperature: float = 1.0,
+) -> jax.Array:
+  """Update ancestor sequences using stacked array (vmap-compatible).
+
+  Unlike update_seq which uses a Python list, this version uses a single
+  stacked array for ancestors, making it compatible with jax.vmap.
+
+  Args:
+      ancestors: Stacked ancestor logits, shape (n_ancestors, seq_len, n_states)
+      sequences: Full sequence array, shape (n_all, seq_len, n_states)
+      n_leaves: Number of leaf nodes
+      temperature: Softmax temperature
+
+  Returns:
+      Updated sequences with ancestors replaced by softmax of logits
+  """
+  updated_ancestors = jax.nn.softmax(ancestors * temperature, axis=-1)
+  return sequences.at[n_leaves:].set(updated_ancestors)
+
+
+def run_trex_optimization_batched(
+  leaf_sequences: jax.Array,
+  n_all: int,
+  n_leaves: int,
+  n_states: int,
+  adj_matrix: jax.Array,
+  key: PRNGKeyArray,
+  use_soft_cost: bool = False,
+  n_iterations: int = 10000,
+) -> jax.Array:
+  """Run TREX optimization with vmap-compatible structure.
+
+  This version uses a stacked array for ancestors (not a Python list),
+  making it compatible with jax.vmap over batch dimensions.
+
+  Args:
+      leaf_sequences: Observed sequences at leaves. Shape: (n_leaves, seq_len)
+      n_all: Total number of nodes in the tree
+      n_leaves: Number of leaf nodes
+      n_states: Alphabet size
+      adj_matrix: Adjacency matrix representing tree structure
+      key: JAX random key
+      use_soft_cost: If True, use soft cost; else use surrogate cost
+      n_iterations: Number of optimization iterations
+
+  Returns:
+      Reconstructed ancestor sequences, shape (n_ancestors, seq_len)
+  """
+  key, subkey = jax.random.split(key)
+  seq_len = leaf_sequences.shape[1]
+  n_ancestors = n_all - n_leaves
+
+  # Initialize ancestors as stacked array (not list!)
+  ancestors = jax.random.normal(subkey, (n_ancestors, seq_len, n_states))
+
+  # Create optimizer
+  optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(1e-3))
+  opt_state = optimizer.init(ancestors)
+
+  # One-hot encode leaf sequences
+  leaf_sequences_one_hot = jax.nn.one_hot(leaf_sequences, n_states)
+
+  # Create full sequence array (leaves + zeros for ancestors)
+  masked_sequences = jnp.concatenate(
+    [
+      leaf_sequences_one_hot,
+      jnp.zeros((n_ancestors, seq_len, n_states)),
+    ],
+    axis=0,
+  ).astype(jnp.float32)
+
+  # Cost matrix for soft cost
+  identity_cost_matrix = jnp.eye(n_states, dtype=jnp.float32)
+
+  if use_soft_cost:
+
+    def loss_fn(ancestors):
+      updated = _update_seq_stacked(ancestors, masked_sequences, n_leaves, 1.0)
+      return compute_soft_cost(updated, adj_matrix, cost_matrix=identity_cost_matrix)
+  else:
+
+    def loss_fn(ancestors):
+      updated = _update_seq_stacked(ancestors, masked_sequences, n_leaves, 1.0)
+      return compute_surrogate_cost(updated, adj_matrix)
+
+  loss_and_grad = jax.value_and_grad(loss_fn)
+
+  def training_step(i, carry):
+    ancestors, opt_state = carry
+    _, grads = loss_and_grad(ancestors)
+    updates, opt_state = optimizer.update(grads, opt_state)
+    ancestors = optax.apply_updates(ancestors, updates)
+    return ancestors, opt_state
+
+  ancestors, _ = jax.lax.fori_loop(
+    0,
+    n_iterations,
+    training_step,
+    (ancestors, opt_state),
+  )
+
+  return jnp.argmax(ancestors, axis=-1)
 
 
 @custom_vjp
@@ -256,6 +530,23 @@ def create_balanced_binary_tree(n_leaves: int) -> jax.Array:
   return adj.at[n_leaves + jnp.arange(n_ancestors - 1), ancestor_parents].set(1)
 
 
+def _loss_fn_soft(key, params, masked_sequences, temperature, adjacency, cost_matrix):
+  """Loss function using compute_soft_cost with explicit cost_matrix."""
+  updated_sequences = update_seq(params, masked_sequences, temperature)
+  return compute_soft_cost(updated_sequences, adjacency, cost_matrix=cost_matrix)
+
+
+def _loss_fn_surrogate(key, params, masked_sequences, temperature, adjacency):
+  """Loss function using compute_surrogate_cost."""
+  updated_sequences = update_seq(params, masked_sequences, temperature)
+  return compute_surrogate_cost(updated_sequences, adjacency)
+
+
+# Pre-compile the loss_and_grad functions at module level
+_loss_and_grad_soft = jax.jit(jax.value_and_grad(_loss_fn_soft, argnums=1))
+_loss_and_grad_surrogate = jax.jit(jax.value_and_grad(_loss_fn_surrogate, argnums=1))
+
+
 def run_trex_optimization(
   leaf_sequences: jax.Array,
   n_all: int,
@@ -263,6 +554,7 @@ def run_trex_optimization(
   n_states: int,
   adj_matrix: jax.Array,
   key: PRNGKeyArray,
+  use_soft_cost: bool = False,
 ) -> jax.Array:
   """Run the trex optimization to reconstruct ancestral sequences."""
   key, subkey = jax.random.split(key)
@@ -289,40 +581,51 @@ def run_trex_optimization(
     axis=0,
   ).astype(jnp.float32)
 
-  # metadata
-  metadata = {
-    "n_all": n_all,
-    "n_leaves": n_leaves,
-    "n_states": n_states,
-  }
+  # Pre-compute identity cost matrix for soft cost (avoids creating inside JIT)
+  identity_cost_matrix = jnp.eye(n_states, dtype=jnp.float32)
 
-  # JIT compile the loss and gradient calculation
-  loss_and_grad = jax.jit(
-    jax.value_and_grad(compute_loss, argnums=1),
-    static_argnames=("fix_tree",),
-  )
+  # Select the appropriate loss_and_grad function
+  if use_soft_cost:
 
-  # Training loop
-  def training_step(
-    i: jax.Array,
-    carry: tuple[dict, optax.OptState, PRNGKeyArray],
-  ) -> tuple[dict, optax.OptState, PRNGKeyArray]:
-    params, opt_state, key = carry
-    _, grads = loss_and_grad(
-      key,
-      params,
-      masked_sequences,
-      metadata,
-      temperature=1.0,
-      adjacency=adj_matrix,
-      fix_tree=True,
-    )
-    updates, opt_state = optimizer.update(grads, opt_state)
-    params = cast(
-      "dict[str, jax.Array | list[jax.Array]]",
-      (optax.apply_updates(params, updates)),
-    )
-    return params, opt_state, key
+    def training_step(
+      i: jax.Array,
+      carry: tuple[dict, optax.OptState, PRNGKeyArray],
+    ) -> tuple[dict, optax.OptState, PRNGKeyArray]:
+      params, opt_state, key = carry
+      _, grads = _loss_and_grad_soft(
+        key,
+        params,
+        masked_sequences,
+        1.0,  # temperature
+        adj_matrix,
+        identity_cost_matrix,
+      )
+      updates, opt_state = optimizer.update(grads, opt_state)
+      params = cast(
+        "dict[str, jax.Array | list[jax.Array]]",
+        (optax.apply_updates(params, updates)),
+      )
+      return params, opt_state, key
+  else:
+
+    def training_step(
+      i: jax.Array,
+      carry: tuple[dict, optax.OptState, PRNGKeyArray],
+    ) -> tuple[dict, optax.OptState, PRNGKeyArray]:
+      params, opt_state, key = carry
+      _, grads = _loss_and_grad_surrogate(
+        key,
+        params,
+        masked_sequences,
+        1.0,  # temperature
+        adj_matrix,
+      )
+      updates, opt_state = optimizer.update(grads, opt_state)
+      params = cast(
+        "dict[str, jax.Array | list[jax.Array]]",
+        (optax.apply_updates(params, updates)),
+      )
+      return params, opt_state, key
 
   params, _, _ = jax.lax.fori_loop(
     0,

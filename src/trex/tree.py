@@ -38,62 +38,62 @@ def discretize_tree_topology(
 
 @jax.jit
 def update_tree(
-    key: PRNGKeyArray,
-    params: dict[str, Array],
-    temperature: float = 1.0,
-    gates: Array | None = None,
+  key: PRNGKeyArray,
+  params: dict[str, Array],
+  temperature: float = 1.0,
+  gates: Array | None = None,
 ) -> AdjacencyMatrix:
-    """Update and return a soft tree topology using trainable parameters.
-    This function uses the Gumbel-Softmax trick to produce a differentiable
-    approximation of a discrete tree structure. It can also apply a gating
-    mechanism to the logits before the softmax.
-    """
-    tree_params = params["tree_params"]
-    n_all_minus_1, n_ancestors = tree_params.shape
-    n_total_nodes = n_all_minus_1 + 1
-    n_leaves = n_total_nodes - n_ancestors
+  """Update and return a soft tree topology using trainable parameters.
 
-    if n_ancestors == 0:
-        return jnp.eye(n_total_nodes, dtype=tree_params.dtype)
+  This function uses the Gumbel-Softmax trick to produce a differentiable
+  approximation of a discrete tree structure. It can also apply a gating
+  mechanism to the logits before the softmax.
+  """
+  tree_params = params["tree_params"]
+  n_all_minus_1, n_ancestors = tree_params.shape
+  n_total_nodes = n_all_minus_1 + 1
+  n_leaves = n_total_nodes - n_ancestors
 
-    gumbel_noise = jax.random.gumbel(key, shape=tree_params.shape)
-    perturbed_params = (tree_params + gumbel_noise)
+  if n_ancestors == 0:
+    return jnp.eye(n_total_nodes, dtype=tree_params.dtype)
 
-    # Apply gates to the logits before the temperature scaling
-    if gates is not None:
-        perturbed_params *= gates
+  gumbel_noise = jax.random.gumbel(key, shape=tree_params.shape)
+  perturbed_params = tree_params + gumbel_noise
 
-    perturbed_params /= temperature
+  # Apply gates to the logits before the temperature scaling
+  if gates is not None:
+    perturbed_params *= gates
 
+  perturbed_params /= temperature
 
-    # Start with a matrix of -infinity, which corresponds to zero probability after softmax
-    final_logits = jnp.full((n_total_nodes, n_total_nodes), -jnp.inf)
+  # Start with a matrix of -infinity, which corresponds to zero probability after softmax
+  final_logits = jnp.full((n_total_nodes, n_total_nodes), -jnp.inf)
 
-    # 1. Populate leaf-to-ancestor logits (n_leaves x n_ancestors)
-    leaf_logits = perturbed_params[:n_leaves]
-    final_logits = final_logits.at[:n_leaves, n_leaves:].set(leaf_logits)
+  # 1. Populate leaf-to-ancestor logits (n_leaves x n_ancestors)
+  leaf_logits = perturbed_params[:n_leaves]
+  final_logits = final_logits.at[:n_leaves, n_leaves:].set(leaf_logits)
 
-    # 2. Populate ancestor-to-ancestor logits
-    # An ancestor i can only be a child of an ancestor j if j > i.
-    # This creates an upper-triangular structure for the ancestor block.
-    ancestor_logits = perturbed_params[n_leaves:]
+  # 2. Populate ancestor-to-ancestor logits
+  # An ancestor i can only be a child of an ancestor j if j > i.
+  # This creates an upper-triangular structure for the ancestor block.
+  ancestor_logits = perturbed_params[n_leaves:]
 
-    # Create a mask to enforce the acyclic, upper-triangular constraint.
-    # The mask shape is (n_ancestors - 1, n_ancestors) to match the logits.
-    i = jnp.arange(n_ancestors - 1)[:, None]
-    j = jnp.arange(n_ancestors)[None, :]
-    # The mask is True where column index j is strictly greater than row index i
-    # (relative to the ancestor-only block).
-    ancestor_mask = j > i
+  # Create a mask to enforce the acyclic, upper-triangular constraint.
+  # The mask shape is (n_ancestors - 1, n_ancestors) to match the logits.
+  i = jnp.arange(n_ancestors - 1)[:, None]
+  j = jnp.arange(n_ancestors)[None, :]
+  # The mask is True where column index j is strictly greater than row index i
+  # (relative to the ancestor-only block).
+  ancestor_mask = j > i
 
-    # Apply the mask: invalid connections become -inf.
-    masked_ancestor_logits = jnp.where(ancestor_mask, ancestor_logits, -jnp.inf)
-    final_logits = final_logits.at[n_leaves:-1, n_leaves:].set(masked_ancestor_logits)
+  # Apply the mask: invalid connections become -inf.
+  masked_ancestor_logits = jnp.where(ancestor_mask, ancestor_logits, -jnp.inf)
+  final_logits = final_logits.at[n_leaves:-1, n_leaves:].set(masked_ancestor_logits)
 
-    # 3. The root has no parent, so it points to itself before the softmax.
-    final_logits = final_logits.at[-1, -1].set(1.0)
+  # 3. The root has no parent, so it points to itself before the softmax.
+  final_logits = final_logits.at[-1, -1].set(1.0)
 
-    return nn.softmax(final_logits, axis=1)
+  return nn.softmax(final_logits, axis=1)
 
 
 @jax.jit
@@ -125,8 +125,14 @@ def enforce_graph_constraints(
   scaling_factor: float,
 ) -> Cost:
   """Calculate a loss to enforce that the tree is binary.
+
   This loss penalizes deviations from the constraint that each ancestor node
   should have exactly two children.
+
+  This loss penalizes deviations from the ideal child sum of 2 using a
+  squared difference creates a quadratic penalty.
+  The scaling factor is applied to the final sum to balance it with
+  the primary surrogate cost.
 
   Args:
       adjacency: The soft tree topology.
@@ -140,10 +146,6 @@ def enforce_graph_constraints(
   n_ancestor_nodes = (n_total_nodes - 1) // 2
   ancestor_columns = adjacency[:-1, -n_ancestor_nodes:]
   child_sums = jnp.sum(ancestor_columns, axis=0)
-  # This loss penalizes deviations from the ideal child sum of 2.
-  # Using a squared difference creates a quadratic penalty.
-  # The scaling factor is applied to the final sum to balance it with
-  # the primary surrogate cost.
   return scaling_factor * jnp.sum((child_sums - 2) ** 2)
 
 
@@ -161,6 +163,49 @@ def compute_surrogate_cost(
   squared_distance = jnp.sum(diff**2, axis=(-1, -2))
 
   return jnp.sum(squared_distance * adjacency) / 2
+
+
+@jax.jit
+def compute_soft_cost(
+  sequences: jnp.ndarray,  # (n_nodes, seq_len, n_states)
+  adjacency: jnp.ndarray,  # (n_nodes, n_nodes)
+  cost_matrix: jnp.ndarray | None = None,
+) -> jnp.ndarray:
+  """Compute a soft evolutionary cost using weighted squared distance.
+
+  Computes: sum_{edges (i,j)} sum_l (S_i[l] - S_j[l])^T @ C @ (S_i[l] - S_j[l])
+
+  This is equivalent to compute_surrogate_cost when C = I (identity), and
+  matches Sankoff's cost semantics when sequences are one-hot (discrete).
+
+  Args:
+      sequences: Sequence probabilities or one-hot vectors. Shape (N, L, Q).
+      adjacency: Tree structure. Shape (N, N).
+      cost_matrix: Substitution cost matrix. Shape (Q, Q).
+                   Defaults to Identity (standard squared Euclidean distance).
+
+  Returns:
+      Scalar cost value.
+
+  """
+  n_states = sequences.shape[-1]
+  if cost_matrix is None:
+    cost_matrix = jnp.eye(n_states)
+
+  # Compute pairwise differences: diff[i,j,l,q] = S_i[l,q] - S_j[l,q]
+  # Shape: (N, N, L, Q)
+  diff = sequences[:, jnp.newaxis, :, :] - sequences[jnp.newaxis, :, :, :]
+
+  # Apply cost matrix: diff @ C -> (N, N, L, Q)
+  weighted_diff = diff @ cost_matrix
+
+  # Compute quadratic form: sum over q of diff * weighted_diff
+  # Then sum over positions l, weighted by adjacency
+  # cost_per_edge[i,j] = sum_l sum_q diff[i,j,l,q] * weighted_diff[i,j,l,q]
+  cost_per_edge = jnp.sum(diff * weighted_diff, axis=(-1, -2))
+
+  # Weight by adjacency and sum (divide by 2 for undirected edges)
+  return jnp.sum(cost_per_edge * adjacency) / 2
 
 
 @jax.jit
