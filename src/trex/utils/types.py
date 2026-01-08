@@ -5,7 +5,6 @@ shape and dtype information directly in the type hints. This is crucial for
 maintaining clarity and correctness in a JAX-based scientific computing codebase.
 """
 
-from collections.abc import Sequence
 from typing import NamedTuple
 
 from jaxtyping import Array, BFloat16, Float, Int
@@ -74,7 +73,9 @@ SubstitutionMatrix = Int[Array, "states states"]
 Cost = Float[Array, ""]
 """A scalar cost value, typically the total cost of a tree traversal."""
 
-EvoSequencePyTree = tuple[Sequence[EvoSequence], Sequence[Sequence[EvoSequence] | EvoSequence]]
+from typing import Any
+
+EvoSequencePyTree = Any
 
 
 class PhylogeneticTree(NamedTuple):

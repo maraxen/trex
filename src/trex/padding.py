@@ -14,6 +14,7 @@ padded positions from computations.
 References:
     - projects/asr/src/asr/oed/padding.py (original implementation)
     - .agents/codestyles/jax.md (static shape guidelines)
+
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ def get_bucket(value: int, buckets: tuple[int, ...]) -> int:
 
   Raises:
       ValueError: If value exceeds all buckets.
+
   """
   for bucket in buckets:
     if value <= bucket:
@@ -54,6 +56,7 @@ def get_n_bucket(n: int) -> int:
 
   Returns:
       The bucket size to use for sequence-length arrays.
+
   """
   return get_bucket(n, N_BUCKETS)
 
@@ -66,6 +69,7 @@ def get_k_bucket(k: int) -> int:
 
   Returns:
       The bucket size to use for K-dimensioned arrays.
+
   """
   return get_bucket(k, K_BUCKETS)
 
@@ -79,6 +83,7 @@ def pad_sequence(sequence: Array, target_n: int) -> Array:
 
   Returns:
       Padded sequence of shape (target_n,) or (batch, target_n).
+
   """
   if sequence.ndim == 1:
     current_n = sequence.shape[0]
@@ -99,6 +104,7 @@ def pad_sequences_batch(sequences: Array, target_n: int) -> Array:
 
   Returns:
       Padded sequences of shape (batch, target_n).
+
   """
   current_n = sequences.shape[1]
   if current_n >= target_n:
@@ -116,6 +122,7 @@ def create_sequence_mask(real_n: int, padded_n: int) -> Bool[Array, " padded_n"]
 
   Returns:
       Boolean mask of shape (padded_n,), True for valid positions.
+
   """
   return jnp.arange(padded_n) < real_n
 
@@ -129,6 +136,7 @@ def create_node_mask(real_nodes: int, max_nodes: int = MAX_NODES) -> Bool[Array,
 
   Returns:
       Boolean mask of shape (max_nodes,), True for valid nodes.
+
   """
   return jnp.arange(max_nodes) < real_nodes
 
@@ -156,6 +164,7 @@ def pad_fitness_table(
 
   Returns:
       Padded fitness tables of shape (target_n, q^(target_k+1)).
+
   """
   # Pad K dimension (if needed, expand table)
   real_table_size = q ** (real_k + 1)
@@ -174,7 +183,7 @@ def pad_fitness_table(
 
 
 def pad_interactions(
-  interactions: Array, real_n: int, real_k: int, target_n: int, target_k: int
+  interactions: Array, real_n: int, real_k: int, target_n: int, target_k: int,
 ) -> Array:
   """Pad interaction indices for the NK model.
 
@@ -190,6 +199,7 @@ def pad_interactions(
 
   Returns:
       Padded interactions of shape (target_n, target_k).
+
   """
   # Pad K dimension first
   k_pad = target_k - real_k
@@ -213,6 +223,7 @@ def pad_adjacency(adjacency: Array, target_nodes: int = MAX_NODES) -> Array:
 
   Returns:
       Padded adjacency matrix of shape (target_nodes, target_nodes).
+
   """
   real_nodes = adjacency.shape[0]
   n_pad = target_nodes - real_nodes
@@ -222,7 +233,7 @@ def pad_adjacency(adjacency: Array, target_nodes: int = MAX_NODES) -> Array:
 
 
 def pad_tree_sequences(
-  sequences: Array, target_nodes: int = MAX_NODES, target_n: int | None = None
+  sequences: Array, target_nodes: int = MAX_NODES, target_n: int | None = None,
 ) -> Array:
   """Pad tree sequences to target dimensions.
 
@@ -233,6 +244,7 @@ def pad_tree_sequences(
 
   Returns:
       Padded sequences.
+
   """
   real_nodes = sequences.shape[0]
   real_n = sequences.shape[1]
@@ -260,6 +272,7 @@ def masked_mean(values: Array, mask: Array) -> Float[Array, ""]:
 
   Returns:
       Mean over valid elements.
+
   """
   return jnp.sum(values * mask) / jnp.sum(mask)
 
@@ -273,5 +286,6 @@ def masked_sum(values: Array, mask: Array) -> Float[Array, ""]:
 
   Returns:
       Sum over valid elements.
+
   """
   return jnp.sum(values * mask)

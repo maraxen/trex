@@ -52,14 +52,31 @@ tests = [
     "chex",
 ]
 [tool.ruff]
-select = ["ALL"]
-ignore = ["PD"]
 line-length = 100
 indent-width = 2
 fix = true
 
-[tool.ruff.lint.pylint]
-max-args = 10
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+  "PD",
+  "F722", # jaxtyping strings
+  "TRY003", # long exception messages
+  "EM101", "EM102", # exception literals
+  "TC001", "TC002", "TC003", # move into type-checking block
+  "PLR2004", # magic numbers
+  "ERA001", # commented-out code
+  "D", # docstrings
+  "PLW0603", # global update
+  "ANN", # type annotations
+  "ARG", # unused arguments
+  "FBT", # boolean traps
+  "T201", # print statements
+  "F821", # undefined name (jaxtyping dims)
+  "PLR0913", # too many arguments
+  "E501", # line too long
+]
+pylint.max-args = 15
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

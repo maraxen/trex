@@ -96,81 +96,97 @@ def run_dp(
 vectorized_dp = jax.vmap(run_dp, (None, 0, 0, 1, None), 0)
 
 
-@partial(jax.jit, static_argnames=("return_path", "n_all", "n_states", "n_leaves"))
-def run_sankoff(
-  adjacency_matrix: AdjacencyMatrix,
-  cost_matrix: CostMatrix,
-  sequences: BatchEvoSequence,
-  n_all: int,
-  n_states: int,
-  n_leaves: int,
-  *,
-  return_path: bool = False,
-) -> tuple[BatchEvoSequence, VmappedDPTable, TotalCost]:
-  """Run the Sankoff algorithm over a batch of sequences.
+from typing import TYPE_CHECKING
 
-  Args:
-      adjacency_matrix: The adjacency matrix of the tree.
-      cost_matrix: The substitution cost matrix.
-      sequences: A batch of leaf sequences.
-      n_all (int): The total number of nodes in the tree.
-      n_states (int): The number of possible states (characters).
-      n_leaves (int): The number of leaf nodes.
-      return_path: If True, reconstructs and returns the ancestral sequences.
+if TYPE_CHECKING:
 
-  Returns:
-      A tuple containing the reconstructed sequences (if requested),
-      the final DP table, and the total parsimony score.
+  def run_sankoff(
+    adjacency_matrix: AdjacencyMatrix,
+    cost_matrix: CostMatrix,
+    sequences: BatchEvoSequence,
+    n_all: int,
+    n_states: int,
+    n_leaves: int,
+    *,
+    return_path: bool = False,
+  ) -> tuple[BatchEvoSequence, VmappedDPTable, TotalCost]: ...
+else:
 
-  """
-  adjacency_matrix = adjacency_matrix.at[-1, -1].set(0)  # Remove self-connection at the root
+  @partial(jax.jit, static_argnames=("return_path", "n_all", "n_states", "n_leaves"))
+  def run_sankoff(
+    adjacency_matrix: AdjacencyMatrix,
+    cost_matrix: CostMatrix,
+    sequences: BatchEvoSequence,
+    n_all: int,
+    n_states: int,
+    n_leaves: int,
+    *,
+    return_path: bool = False,
+  ) -> tuple[BatchEvoSequence, VmappedDPTable, TotalCost]:
+    """Run the Sankoff algorithm over a batch of sequences.
 
-  # Ensure correct dtypes
-  adjacency_matrix = adjacency_matrix.astype(get_default_dtype())
-  sequences = sequences.astype(get_default_dtype())
-  cost_matrix = cost_matrix.astype(get_default_dtype())
+    Args:
+        adjacency_matrix: The adjacency matrix of the tree.
+        cost_matrix: The substitution cost matrix.
+        sequences: A batch of leaf sequences.
+        n_all (int): The total number of nodes in the tree.
+        n_states (int): The number of possible states (characters).
+        n_leaves (int): The number of leaf nodes.
+        return_path: If True, reconstructs and returns the ancestral sequences.
 
-  sequence_length = sequences.shape[1]
+    Returns:
+        A tuple containing the reconstructed sequences (if requested),
+        the final DP table, and the total parsimony score.
 
-  # Initialize DP tables
-  dp_nodes = jnp.zeros((sequence_length, n_all, n_states, 4), dtype=get_default_dtype())
-  dp = jnp.full((sequence_length, n_all, n_states), 1e5, dtype=get_default_dtype())
+    """
+    adjacency_matrix = adjacency_matrix.at[-1, -1].set(0)  # Remove self-connection at the root
 
-  dp, backtracking_connections = vectorized_dp(
-    adjacency_matrix,
-    dp,
-    dp_nodes,
-    sequences,
-    cost_matrix,
-  )
-  reconstructed_sequences = jnp.zeros((n_all, sequence_length), dtype=get_default_dtype())
-  reconstructed_sequences = reconstructed_sequences.at[:n_leaves, :].set(sequences[:n_leaves])
-  if return_path:
-    root_node = jnp.asarray(adjacency_matrix.shape[0] - 1, jnp.int32)
+    # Ensure correct dtypes
+    adjacency_matrix = adjacency_matrix.astype(get_default_dtype())
+    sequences = sequences.astype(get_default_dtype())
+    cost_matrix = cost_matrix.astype(get_default_dtype())
 
-    vmapped_backtrack = jax.vmap(
-      backtrack_sankoff_jit,
-      in_axes=(None, 0, 0, None, None),
-      out_axes=1,
+    sequence_length = sequences.shape[1]
+
+    # Initialize DP tables
+    dp_nodes = jnp.zeros((sequence_length, n_all, n_states, 4), dtype=get_default_dtype())
+    dp = jnp.full((sequence_length, n_all, n_states), 1e5, dtype=get_default_dtype())
+
+    dp, backtracking_connections = vectorized_dp(
+      adjacency_matrix,
+      dp,
+      dp_nodes,
+      sequences,
+      cost_matrix,
     )
+    reconstructed_sequences = jnp.zeros((n_all, sequence_length), dtype=get_default_dtype())
+    reconstructed_sequences = reconstructed_sequences.at[:n_leaves, :].set(sequences[:n_leaves])
+    if return_path:
+      root_node = jnp.asarray(adjacency_matrix.shape[0] - 1, jnp.int32)
 
-    all_root_states = jnp.argmin(dp[:, root_node, :], axis=1).astype(jnp.int32)
+      vmapped_backtrack = jax.vmap(
+        backtrack_sankoff_jit,
+        in_axes=(None, 0, 0, None, None),
+        out_axes=1,
+      )
 
-    all_reconstructed_chars = vmapped_backtrack(
-      root_node,
-      all_root_states,
-      backtracking_connections,
-      n_all,
-      n_leaves,
-    )
+      all_root_states = jnp.argmin(dp[:, root_node, :], axis=1).astype(jnp.int32)
 
-    ancestor_chars = all_reconstructed_chars[n_leaves:]
-    reconstructed_sequences = reconstructed_sequences.at[n_leaves:, :].set(
-      ancestor_chars,
-    )
+      all_reconstructed_chars = vmapped_backtrack(
+        root_node,
+        all_root_states,
+        backtracking_connections,
+        n_all,
+        n_leaves,
+      )
 
-  total_cost = dp[:, -1].min(axis=1).sum()
-  return reconstructed_sequences, dp, total_cost
+      ancestor_chars = all_reconstructed_chars[n_leaves:]
+      reconstructed_sequences = reconstructed_sequences.at[n_leaves:, :].set(
+        ancestor_chars,
+      )
+
+    total_cost = dp[:, -1].min(axis=1).sum()
+    return reconstructed_sequences, dp, total_cost
 
 
 @partial(jax.jit, static_argnames=("n_all", "n_leaves"))

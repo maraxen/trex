@@ -20,7 +20,7 @@ import optax
 from jax import custom_vjp
 
 # Add this with your other imports
-from jaxtyping import Array, Bool, Float, PRNGKeyArray, PyTree
+from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray, PyTree
 
 from trex.nk_model import create_nk_model_landscape, generate_tree_data
 from trex.sankoff import run_sankoff
@@ -729,8 +729,8 @@ def run_trex_landscape_aware(
       adj_matrix=adj_matrix,
     )
     # jax.debug.print("Grads: {grads}", grads=grads)
-    updates, opt_state = optimizer.update(grads, opt_state)
-    params = cast("dict[str, jax.Array | list[jax.Array]]", (optax.apply_updates(params, updates)))
+    updates, opt_state = optimizer.update(grads, opt_state, params)
+    params = cast("dict[str, jax.Array | list[jax.Array]]", optax.apply_updates(params, updates))
     return params, opt_state, key
 
   params, _, _ = jax.lax.fori_loop(
@@ -951,7 +951,9 @@ if __name__ == "__main__":
   num_replicates = 2  # Use a smaller number for faster testing
 
   # Setup storage for results
-  all_results = {K: {"sankoff": [], "trex": {L: [] for L in lambda_values}} for K in K_values}
+  all_results: dict[int, dict[str, Any]] = {
+    K: {"sankoff": [], "trex": {L: [] for L in lambda_values}} for K in K_values
+  }
 
   key = jax.random.PRNGKey(0)
   print(f"Running benchmark for {num_replicates} replicates...")

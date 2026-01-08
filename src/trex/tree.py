@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import partial
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -19,24 +20,31 @@ from trex.utils.types import (
   SubstitutionMatrix,
 )
 
+if TYPE_CHECKING:
 
-@partial(jax.jit, static_argnames=("n_nodes",))
-def discretize_tree_topology(
-  adjacency: AdjacencyMatrix,
-  n_nodes: int,
-) -> AdjacencyMatrix:
-  """Discretize a soft tree topology into a one-hot representation.
+  def discretize_tree_topology(
+    adjacency: AdjacencyMatrix,
+    n_nodes: int,
+  ) -> AdjacencyMatrix: ...
+else:
 
-  Args:
-      adjacency: A soft tree topology (e.g., after softmax).
-      n_nodes: The total number of nodes in the tree.
+  @partial(jax.jit, static_argnames=("n_nodes",))
+  def discretize_tree_topology(
+    adjacency: AdjacencyMatrix,
+    n_nodes: int,
+  ) -> AdjacencyMatrix:
+    """Discretize a soft tree topology into a one-hot representation.
 
-  Returns:
-      A one-hot encoded, discrete tree topology.
+    Args:
+        adjacency: A soft tree topology (e.g., after softmax).
+        n_nodes: The total number of nodes in the tree.
 
-  """
-  max_indices = jnp.argmax(adjacency, axis=1)
-  return nn.one_hot(max_indices, n_nodes)
+    Returns:
+        A one-hot encoded, discrete tree topology.
+
+    """
+    max_indices = jnp.argmax(adjacency, axis=1)
+    return nn.one_hot(max_indices, n_nodes)
 
 
 @jax.jit
