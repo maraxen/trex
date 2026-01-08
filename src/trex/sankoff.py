@@ -5,6 +5,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
+from trex.types import get_default_dtype
 from trex.utils.types import (
   AdjacencyMatrix,
   BacktrackingTable,
@@ -125,15 +126,15 @@ def run_sankoff(
   adjacency_matrix = adjacency_matrix.at[-1, -1].set(0)  # Remove self-connection at the root
 
   # Ensure correct dtypes
-  adjacency_matrix = adjacency_matrix.astype(jnp.float32)
-  sequences = sequences.astype(jnp.float32)
-  cost_matrix = cost_matrix.astype(jnp.float32)
+  adjacency_matrix = adjacency_matrix.astype(get_default_dtype())
+  sequences = sequences.astype(get_default_dtype())
+  cost_matrix = cost_matrix.astype(get_default_dtype())
 
   sequence_length = sequences.shape[1]
 
   # Initialize DP tables
-  dp_nodes = jnp.zeros((sequence_length, n_all, n_states, 4), dtype=jnp.float32)
-  dp = jnp.full((sequence_length, n_all, n_states), 1e5, dtype=jnp.float32)
+  dp_nodes = jnp.zeros((sequence_length, n_all, n_states, 4), dtype=get_default_dtype())
+  dp = jnp.full((sequence_length, n_all, n_states), 1e5, dtype=get_default_dtype())
 
   dp, backtracking_connections = vectorized_dp(
     adjacency_matrix,
@@ -142,7 +143,7 @@ def run_sankoff(
     sequences,
     cost_matrix,
   )
-  reconstructed_sequences = jnp.zeros((n_all, sequence_length), dtype=jnp.float32)
+  reconstructed_sequences = jnp.zeros((n_all, sequence_length), dtype=get_default_dtype())
   reconstructed_sequences = reconstructed_sequences.at[:n_leaves, :].set(sequences[:n_leaves])
   if return_path:
     root_node = jnp.asarray(adjacency_matrix.shape[0] - 1, jnp.int32)

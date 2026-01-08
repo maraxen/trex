@@ -38,13 +38,9 @@ The core innovation lies in making traditionally discrete phylogenetic operation
 2. **Install dependencies:**
 
    ```bash
-   pip install -r requirements.txt
-   ```
-
-   Or if using the project configuration:
-
-   ```bash
-   pip install -e .
+   uv sync --extra cuda  # For GPU
+   uv sync --extra tpu   # For TPU
+   uv sync --extra cpu   # For CPU-only (default)
    ```
 
 ## Testing

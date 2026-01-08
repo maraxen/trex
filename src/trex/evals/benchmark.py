@@ -9,6 +9,8 @@ When λ>0, TREX also considers the fitness of reconstructed ancestral
 sequences according to the NK landscape.
 """
 
+from __future__ import annotations
+
 from typing import Any, cast
 
 import jax
@@ -18,11 +20,12 @@ import optax
 from jax import custom_vjp
 
 # Add this with your other imports
-from jaxtyping import PRNGKeyArray, PyTree
+from jaxtyping import Array, Bool, Float, PRNGKeyArray, PyTree
 
 from trex.nk_model import create_nk_model_landscape, generate_tree_data
 from trex.sankoff import run_sankoff
 from trex.tree import compute_soft_cost, compute_surrogate_cost, update_seq
+from trex.types import Adjacency, Ancestors, LeafSequences, ScalarFloat, get_default_dtype
 from trex.utils.types import (
   EvoSequence,
   OneHotEvoSequence,
@@ -68,11 +71,11 @@ def create_optimizer(
 
 
 def run_trex_optimization_configurable(
-  leaf_sequences: jax.Array,
+  leaf_sequences: LeafSequences,
   n_all: int,
   n_leaves: int,
   n_states: int,
-  adj_matrix: jax.Array,
+  adj_matrix: Adjacency,
   key: PRNGKeyArray,
   use_soft_cost: bool = False,
   optimizer_name: str = "adam",
@@ -80,7 +83,8 @@ def run_trex_optimization_configurable(
   n_iterations: int = 10000,
   return_losses: bool = False,
   dtype: jnp.dtype | None = None,
-) -> jax.Array | tuple[jax.Array, jax.Array]:
+  mixed_precision: bool = False,
+) -> Ancestors | tuple[Ancestors, Float[Array, n_iterations]]:
   """Run TREX optimization with configurable hyperparameters.
 
   Refactored to use stacked arrays (not Python list) for vmap compatibility.
@@ -99,6 +103,7 @@ def run_trex_optimization_configurable(
       n_iterations: Number of optimization iterations
       return_losses: If True, also return the loss curve
       dtype: Data type for computation (None=float32, jnp.bfloat16 for GPU)
+      mixed_precision: If True, keep parameters in float32 but compute in dtype
 
   Returns:
       If return_losses=False: Reconstructed ancestor sequences (n_ancestors, seq_len)
@@ -112,40 +117,49 @@ def run_trex_optimization_configurable(
 
   # Determine dtype: use bfloat16 on GPU if not specified
   if dtype is None:
-    dtype = jnp.float32
+    dtype = get_default_dtype()
+
+  # In mixed precision, parameters (ancestors) are float32, but compute is dtype
+  param_dtype = jnp.float32 if mixed_precision else dtype
+  compute_dtype = dtype
 
   # Initialize ancestors as stacked array (NOT list!) for vmap compatibility
-  ancestors = jax.random.normal(subkey, (n_ancestors, seq_len, n_states), dtype=dtype)
+  ancestors = jax.random.normal(subkey, (n_ancestors, seq_len, n_states), dtype=param_dtype)
 
   # Create optimizer
   optimizer = create_optimizer(optimizer_name, learning_rate)
   opt_state = optimizer.init(ancestors)
 
-  # One-hot encode leaf sequences
-  leaf_sequences_one_hot = jax.nn.one_hot(leaf_sequences, n_states).astype(dtype)
+  # One-hot encode leaf sequences (always in compute dtype)
+  leaf_sequences_one_hot = jax.nn.one_hot(leaf_sequences, n_states).astype(compute_dtype)
 
   # Create masked sequence array (ancestors initialized to zero)
+  # NOTE: masked_sequences will be in compute_dtype
   masked_sequences = jnp.concatenate(
     [
       leaf_sequences_one_hot,
-      jnp.zeros((n_ancestors, seq_len, n_states), dtype=dtype),
+      jnp.zeros((n_ancestors, seq_len, n_states), dtype=compute_dtype),
     ],
     axis=0,
   )
 
   # Pre-compute identity cost matrix for soft cost
-  identity_cost_matrix = jnp.eye(n_states, dtype=dtype)
+  identity_cost_matrix = jnp.eye(n_states, dtype=compute_dtype)
 
   # Select appropriate loss function using stacked update
   if use_soft_cost:
 
     def loss_fn(ancestors):
-      updated_sequences = _update_seq_stacked(ancestors, masked_sequences, n_leaves, 1.0)
+      # Cast parameters to compute_dtype for forward pass if mixed precision
+      ancestors_compute = ancestors.astype(compute_dtype)
+      updated_sequences = _update_seq_stacked(ancestors_compute, masked_sequences, n_leaves, 1.0)
       return compute_soft_cost(updated_sequences, adj_matrix, cost_matrix=identity_cost_matrix)
   else:
 
     def loss_fn(ancestors):
-      updated_sequences = _update_seq_stacked(ancestors, masked_sequences, n_leaves, 1.0)
+      # Cast parameters to compute_dtype for forward pass if mixed precision
+      ancestors_compute = ancestors.astype(compute_dtype)
+      updated_sequences = _update_seq_stacked(ancestors_compute, masked_sequences, n_leaves, 1.0)
       return compute_surrogate_cost(updated_sequences, adj_matrix)
 
   loss_and_grad = jax.value_and_grad(loss_fn)
@@ -169,7 +183,7 @@ def run_trex_optimization_configurable(
     return jnp.argmax(ancestors, axis=-1), losses
 
   # Use fori_loop when losses not needed (slightly more memory efficient)
-  def training_step(i, carry):
+  def training_step(_, carry):
     ancestors, opt_state = carry
     _, grads = loss_and_grad(ancestors)
     updates, opt_state = optimizer.update(grads, opt_state, ancestors)
@@ -192,11 +206,11 @@ def run_trex_optimization_configurable(
 
 
 def _update_seq_stacked(
-  ancestors: jax.Array,
-  sequences: jax.Array,
+  ancestors: Float[Array, "n_ancestors seq_len n_states"],
+  sequences: Float[Array, "n_nodes seq_len n_states"],
   n_leaves: int,
   temperature: float = 1.0,
-) -> jax.Array:
+) -> Float[Array, "n_nodes seq_len n_states"]:
   """Update ancestor sequences using stacked array (vmap-compatible).
 
   Unlike update_seq which uses a Python list, this version uses a single
@@ -217,15 +231,16 @@ def _update_seq_stacked(
 
 
 def _compute_loss_landscape_aware_stacked(
-  ancestors: jax.Array,
-  masked_sequences: jax.Array,
+  ancestors: Float[Array, "n_ancestors seq_len n_states"],
+  masked_sequences: Float[Array, "n_nodes seq_len n_states"],
   n_leaves: int,
   landscape: PyTree,
-  adj_matrix: jax.Array,
+  adj_matrix: Adjacency,
   n_all: int,
   lambda_val: float,
   temperature: float = 1.0,
-) -> jax.Array:
+  seq_mask: Bool[Array, seq_len] | None = None,
+) -> ScalarFloat:
   """Compute landscape-aware loss using stacked ancestors (vmap-compatible).
 
   Combines parsimony cost with parental guidance fitness cost.
@@ -239,14 +254,24 @@ def _compute_loss_landscape_aware_stacked(
       n_all: Total number of nodes
       lambda_val: Weight for fitness cost (0 = parsimony only)
       temperature: Softmax temperature
+      seq_mask: Optional boolean mask of shape (seq_len,). True for valid positions.
+          If None, all positions are considered valid.
 
   Returns:
       Total loss = surrogate_cost + lambda_val * fitness_cost
 
   """
+  seq_len = masked_sequences.shape[1]
+
+  # Default mask: all positions valid
+  if seq_mask is None:
+    seq_mask = jnp.ones(seq_len, dtype=jnp.bool_)
+
   updated_sequences = _update_seq_stacked(ancestors, masked_sequences, n_leaves, temperature)
 
-  # 1. Parsimony Cost
+  # 1. Parsimony Cost (masked: only count differences at valid positions)
+  # We apply the mask by zeroing out invalid positions in the sequences before cost computation
+  # But compute_surrogate_cost operates on the full array, so we mask the output
   surrogate_cost = compute_surrogate_cost(updated_sequences, adj_matrix)
 
   # 2. Parental Guidance Fitness Cost (only if lambda > 0 AND k > 0)
@@ -261,10 +286,14 @@ def _compute_loss_landscape_aware_stacked(
     parent_logits = compute_parental_logits(parent_soft_seqs, landscape)
 
     log_predictions = jax.nn.log_softmax(parent_logits, axis=-1)
-    cross_entropy = -jnp.sum(child_soft_seqs * log_predictions)
+
+    # Masked cross-entropy: only count valid positions
+    per_position_ce = -jnp.sum(child_soft_seqs * log_predictions, axis=-1)  # (n_all, seq_len)
+    masked_ce = per_position_ce * seq_mask[None, :]  # Broadcast mask
+    cross_entropy = jnp.sum(masked_ce)
 
     is_root = jnp.arange(n_all) == parent_indices
-    return cross_entropy / jnp.sum(~is_root)
+    return cross_entropy / (jnp.sum(~is_root) * jnp.sum(seq_mask))
 
   # Skip fitness computation if lambda is zero OR k is zero (no epistasis)
   should_compute_fitness = (lambda_val > 0.0) & (k > 0)
@@ -278,20 +307,22 @@ def _compute_loss_landscape_aware_stacked(
 
 
 def run_trex_landscape_aware_configurable(
-  leaf_sequences: jax.Array,
+  leaf_sequences: LeafSequences,
   n_all: int,
   n_leaves: int,
   n_states: int,
   landscape: PyTree,
   lambda_val: float,
-  adj_matrix: jax.Array,
+  adj_matrix: Adjacency,
   key: PRNGKeyArray,
   optimizer_name: str = "adam",
   learning_rate: float = 1e-3,
   n_iterations: int = 10000,
   return_losses: bool = False,
   dtype: jnp.dtype | None = None,
-) -> jax.Array | tuple[jax.Array, jax.Array]:
+  seq_mask: Bool[Array, seq_len] | None = None,
+  mixed_precision: bool = False,
+) -> Ancestors | tuple[Ancestors, Float[Array, n_iterations]]:
   """Run landscape-aware TREX optimization with configurable hyperparameters.
 
   Vmap-compatible version using stacked arrays for ancestors.
@@ -311,6 +342,9 @@ def run_trex_landscape_aware_configurable(
       n_iterations: Number of optimization iterations
       return_losses: If True, also return the loss curve
       dtype: Data type for computation (None=float32)
+      seq_mask: Optional boolean mask of shape (seq_len,). True for valid positions.
+          If None, all positions are considered valid.
+      mixed_precision: If True, keep parameters in float32 but compute in dtype
 
   Returns:
       If return_losses=False: Reconstructed ancestor sequences (n_ancestors, seq_len)
@@ -322,31 +356,37 @@ def run_trex_landscape_aware_configurable(
   n_ancestors = n_all - n_leaves
 
   if dtype is None:
-    dtype = jnp.float32
+    dtype = get_default_dtype()
+
+  # In mixed precision, parameters (ancestors) are float32, but compute is dtype
+  param_dtype = jnp.float32 if mixed_precision else dtype
+  compute_dtype = dtype
 
   # Initialize ancestors as stacked array for vmap compatibility
-  ancestors = jax.random.normal(subkey, (n_ancestors, seq_len, n_states), dtype=dtype)
+  ancestors = jax.random.normal(subkey, (n_ancestors, seq_len, n_states), dtype=param_dtype)
 
   # Create optimizer
   optimizer = create_optimizer(optimizer_name, learning_rate)
   opt_state = optimizer.init(ancestors)
 
   # One-hot encode leaf sequences
-  leaf_sequences_one_hot = jax.nn.one_hot(leaf_sequences, n_states).astype(dtype)
+  leaf_sequences_one_hot = jax.nn.one_hot(leaf_sequences, n_states).astype(compute_dtype)
 
   # Create masked sequence array
   masked_sequences = jnp.concatenate(
     [
       leaf_sequences_one_hot,
-      jnp.zeros((n_ancestors, seq_len, n_states), dtype=dtype),
+      jnp.zeros((n_ancestors, seq_len, n_states), dtype=compute_dtype),
     ],
     axis=0,
   )
 
-  # Define loss function
+  # Define loss function with seq_mask
   def loss_fn(ancestors):
+    # Cast params to compute_dtype for forward pass if mixed precision
+    ancestors_compute = ancestors.astype(compute_dtype)
     return _compute_loss_landscape_aware_stacked(
-      ancestors,
+      ancestors_compute,
       masked_sequences,
       n_leaves,
       landscape,
@@ -354,6 +394,7 @@ def run_trex_landscape_aware_configurable(
       n_all,
       lambda_val,
       temperature=1.0,
+      seq_mask=seq_mask,
     )
 
   loss_and_grad = jax.value_and_grad(loss_fn)
@@ -377,7 +418,7 @@ def run_trex_landscape_aware_configurable(
     return jnp.argmax(ancestors, axis=-1), losses
 
   # Use fori_loop when losses not needed
-  def training_step(i, carry):
+  def training_step(_, carry):
     ancestors, opt_state = carry
     _, grads = loss_and_grad(ancestors)
     updates, opt_state = optimizer.update(grads, opt_state, ancestors)
@@ -395,15 +436,15 @@ def run_trex_landscape_aware_configurable(
 
 
 def run_trex_optimization_batched(
-  leaf_sequences: jax.Array,
+  leaf_sequences: LeafSequences,
   n_all: int,
   n_leaves: int,
   n_states: int,
-  adj_matrix: jax.Array,
+  adj_matrix: Adjacency,
   key: PRNGKeyArray,
   use_soft_cost: bool = False,
   n_iterations: int = 10000,
-) -> jax.Array:
+) -> Ancestors:
   """Run TREX optimization with vmap-compatible structure.
 
   This version uses a stacked array for ancestors (not a Python list),
@@ -444,10 +485,10 @@ def run_trex_optimization_batched(
       jnp.zeros((n_ancestors, seq_len, n_states)),
     ],
     axis=0,
-  ).astype(jnp.float32)
+  ).astype(get_default_dtype())
 
   # Cost matrix for soft cost
-  identity_cost_matrix = jnp.eye(n_states, dtype=jnp.float32)
+  identity_cost_matrix = jnp.eye(n_states, dtype=get_default_dtype())
 
   if use_soft_cost:
 
@@ -462,7 +503,7 @@ def run_trex_optimization_batched(
 
   loss_and_grad = jax.value_and_grad(loss_fn)
 
-  def training_step(i, carry):
+  def training_step(_, carry):
     ancestors, opt_state = carry
     _, grads = loss_and_grad(ancestors)
     updates, opt_state = optimizer.update(grads, opt_state)
@@ -499,7 +540,7 @@ def ste_fwd(soft_sequence: OneHotEvoSequence) -> tuple[jax.Array, OneHotEvoSeque
 
 
 # Define the backward pass for the VJP
-def ste_bwd(residuals: OneHotEvoSequence, grad_primal_out: jax.Array) -> tuple[jax.Array]:
+def ste_bwd(residuals: OneHotEvoSequence, grad_primal_out: Array) -> tuple[Array]:
   """Backward pass for the straight-through estimator (STE).
 
   It takes the incoming gradient from the next layer (grad_primal_out)
@@ -524,7 +565,7 @@ straight_through_estimator.defvjp(ste_fwd, ste_bwd)
 def compute_parental_logits(
   parent_sequences: OneHotEvoSequence,
   landscape: PyTree,
-) -> jax.Array:
+) -> Float[Array, "n_parents seq_len n_states"]:
   """Compute 'parental logits' for each site for a batch of parent sequences.
 
   The logit for a state at site 'i' is the expected fitness at 'i'
@@ -596,13 +637,13 @@ def compute_loss_landscape_aware(
   sequences: OneHotEvoSequence,
   n_leaves: int,
   landscape: PyTree,
-  adj_matrix: jax.Array,
+  adj_matrix: Adjacency,
   temperature: float,
   n_all: int,
   lambda_val: float,
   *,
   fix_tree: bool = True,
-) -> jax.Array:
+) -> ScalarFloat:
   """Compute surrogate cost + parental guidance cross-entropy cost."""
   updated_sequences = update_seq(params, sequences, temperature)
 
@@ -633,15 +674,15 @@ def compute_loss_landscape_aware(
 
 
 def run_trex_landscape_aware(
-  leaf_sequences: jax.Array,
+  leaf_sequences: LeafSequences,
   n_all: int,
   n_leaves: int,
   n_states: int,
   landscape: PyTree,
   lambda_val: float,
-  adj_matrix: jax.Array,
+  adj_matrix: Adjacency,
   key: PRNGKeyArray,
-) -> jax.Array:
+) -> Ancestors:
   """Run the TREX optimization with the landscape-aware loss."""
   key, subkey = jax.random.split(key)
   params = {
@@ -671,7 +712,7 @@ def run_trex_landscape_aware(
 
   # Training loop
   def training_step(
-    i: jax.Array,
+    _: Int[Array, ""],
     carry: tuple[dict, optax.OptState, PRNGKeyArray],
   ) -> tuple[dict, optax.OptState, PRNGKeyArray]:
     params, opt_state, key = carry
@@ -702,7 +743,7 @@ def run_trex_landscape_aware(
   return jnp.argmax(jnp.stack(params["ancestors"]), axis=-1)
 
 
-def create_balanced_binary_tree(n_leaves: int) -> jax.Array:
+def create_balanced_binary_tree(n_leaves: int) -> Adjacency:
   """Create a balanced binary tree with n_leaves."""
   n_ancestors = n_leaves - 1
   n_total = n_leaves + n_ancestors
@@ -733,14 +774,14 @@ _loss_and_grad_surrogate = jax.jit(jax.value_and_grad(_loss_fn_surrogate, argnum
 
 
 def run_trex_optimization(
-  leaf_sequences: jax.Array,
+  leaf_sequences: LeafSequences,
   n_all: int,
   n_leaves: int,
   n_states: int,
-  adj_matrix: jax.Array,
+  adj_matrix: Adjacency,
   key: PRNGKeyArray,
   use_soft_cost: bool = False,
-) -> jax.Array:
+) -> Ancestors:
   """Run the trex optimization to reconstruct ancestral sequences."""
   key, subkey = jax.random.split(key)
   params = {
@@ -764,16 +805,16 @@ def run_trex_optimization(
   masked_sequences = jnp.concatenate(
     [leaf_sequences_one_hot, jnp.zeros((n_all - n_leaves, leaf_sequences.shape[1], n_states))],
     axis=0,
-  ).astype(jnp.float32)
+  ).astype(get_default_dtype())
 
   # Pre-compute identity cost matrix for soft cost (avoids creating inside JIT)
-  identity_cost_matrix = jnp.eye(n_states, dtype=jnp.float32)
+  identity_cost_matrix = jnp.eye(n_states, dtype=get_default_dtype())
 
   # Select the appropriate loss_and_grad function
   if use_soft_cost:
 
     def training_step(
-      i: jax.Array,
+      _: Int[Array, ""],
       carry: tuple[dict, optax.OptState, PRNGKeyArray],
     ) -> tuple[dict, optax.OptState, PRNGKeyArray]:
       params, opt_state, key = carry
@@ -794,7 +835,7 @@ def run_trex_optimization(
   else:
 
     def training_step(
-      i: jax.Array,
+      _: Int[Array, ""],
       carry: tuple[dict, optax.OptState, PRNGKeyArray],
     ) -> tuple[dict, optax.OptState, PRNGKeyArray]:
       params, opt_state, key = carry

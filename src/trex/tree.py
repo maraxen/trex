@@ -1,5 +1,7 @@
 """Functions for creating, manipulating, and calculating losses on phylogenetic trees."""
 
+from __future__ import annotations
+
 from functools import partial
 
 import jax
@@ -7,6 +9,7 @@ import jax.numpy as jnp
 from jax import nn
 from jaxtyping import Array, PRNGKeyArray
 
+from trex.types import Adjacency, CostMatrix, CostVector, ScalarFloat, SoftSequences
 from trex.utils.types import (
   AdjacencyMatrix,
   BatchEvoSequence,
@@ -151,9 +154,9 @@ def enforce_graph_constraints(
 
 @jax.jit
 def compute_surrogate_cost(
-  sequences: jnp.ndarray,  # (n_nodes, seq_len, n_states)
-  adjacency: jnp.ndarray,  # (n_nodes, n_nodes)
-) -> jnp.ndarray:
+  sequences: SoftSequences,  # (n_nodes, seq_len, n_states)
+  adjacency: Adjacency,  # (n_nodes, n_nodes)
+) -> ScalarFloat:
   r"""Compute a differentiable surrogate for the tree traversal cost.
 
   This version uses arithmetic expansion to avoid large intermediate tensors.
@@ -200,10 +203,10 @@ def compute_surrogate_cost(
 
 @jax.jit
 def compute_soft_cost(
-  sequences: jnp.ndarray,  # (n_nodes, seq_len, n_states)
-  adjacency: jnp.ndarray,  # (n_nodes, n_nodes)
-  cost_matrix: jnp.ndarray | None = None,
-) -> jnp.ndarray:
+  sequences: SoftSequences,  # (n_nodes, seq_len, n_states)
+  adjacency: Adjacency,  # (n_nodes, n_nodes)
+  cost_matrix: CostMatrix | CostVector | None = None,
+) -> ScalarFloat:
   r"""Compute a soft evolutionary cost using weighted squared distance.
 
   This implementation minimizes memory usage by expanding the quadratic form.
@@ -291,7 +294,7 @@ def compute_loss(
   sequences: BatchEvoSequence,
   _metadata: GroundTruthMetadata,
   temperature: float,
-  adjacency: jax.Array,
+  adjacency: Adjacency,
   *,
   graph_constraint_scale: float = 10.0,
   verbose: bool = False,

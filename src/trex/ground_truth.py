@@ -1,12 +1,15 @@
 """Generates a ground truth phylogenetic tree and sequences using JAX."""
 
+from __future__ import annotations
+
 from functools import partial
 
 import jax
 import jax.numpy as jnp
 from jax import jit, random
-from jaxtyping import PRNGKeyArray
+from jaxtyping import Array, Int, PRNGKeyArray
 
+from trex.types import Adjacency, get_default_dtype
 from trex.utils.types import (
   EvoSequence,
   EvoSequencePyTree,
@@ -149,7 +152,7 @@ def generate_groundtruth(
 
   keys = random.split(key, n_ancestors)
 
-  def _generate_children_for_parent(i: jax.Array, all_seqs: jax.Array) -> jax.Array:
+  def _generate_children_for_parent(i: Int[Array, ""], all_seqs: jax.Array) -> jax.Array:
     parent_idx = n_all - 1 - i
     parent_seq = all_seqs[parent_idx]
     p_i = parent_idx - n_leaves
@@ -175,20 +178,20 @@ def generate_groundtruth(
   n_all: int = n_leaves + n_ancestors
 
   def add_edges(
-    tree: jax.Array,
-    i: jax.Array,
-  ) -> tuple[jax.Array, None]:
+    tree: Adjacency,
+    i: Int[Array, ""],
+  ) -> tuple[Adjacency, None]:
     child_idx: jax.Array = 2 * i
     parent_idx: jax.Array = n_leaves + i
     tree = tree.at[child_idx, parent_idx].set(1)
     tree = tree.at[child_idx + 1, parent_idx].set(1)
     return tree, None
 
-  tree: jax.Array = jnp.zeros((n_all, n_all), dtype=jax.numpy.float32)
+  tree: Adjacency = jnp.zeros((n_all, n_all), dtype=get_default_dtype())
   tree, _ = jax.lax.scan(add_edges, tree, jnp.arange(n_ancestors))
 
   return PhylogeneticTree(
-    masked_sequences=masked_main.astype(jnp.bfloat16),
-    all_sequences=true_main.astype(jnp.bfloat16),
-    adjacency=tree.astype(jnp.bfloat16),
+    masked_sequences=masked_main.astype(get_default_dtype()),
+    all_sequences=true_main.astype(get_default_dtype()),
+    adjacency=tree.astype(get_default_dtype()),
   )

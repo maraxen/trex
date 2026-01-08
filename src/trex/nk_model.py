@@ -1,8 +1,12 @@
 """NK model implementation for simulating sequence evolution on a fitness landscape."""
 
+from __future__ import annotations
+
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float, PyTree
+from jaxtyping import Array, PRNGKeyArray, PyTree
+
+from trex.types import Adjacency, ScalarFloat, SeqMask, get_default_dtype
 
 from .utils.types import (
   EvoSequence,
@@ -10,7 +14,7 @@ from .utils.types import (
 )
 
 
-def create_nk_model_landscape(n: int, k: int, key: Array, n_states: int = 2) -> PyTree:
+def create_nk_model_landscape(n: int, k: int, key: PRNGKeyArray, n_states: int = 2) -> PyTree:
   """Create a random fitness landscape for an NK model.
 
   Args:
@@ -39,7 +43,11 @@ def create_nk_model_landscape(n: int, k: int, key: Array, n_states: int = 2) -> 
   }
 
 
-def get_fitness(sequence: EvoSequence, landscape: PyTree) -> Float:
+def get_fitness(
+  sequence: EvoSequence,
+  landscape: PyTree,
+  seq_mask: SeqMask | None = None,
+) -> ScalarFloat:
   r"""Calculate the fitness of a sequence on a given landscape.
 
   This function uses vectorized advanced indexing to avoid explicit loops or vmap
@@ -57,11 +65,11 @@ def get_fitness(sequence: EvoSequence, landscape: PyTree) -> Float:
       -   `table_indices`: Shape $(N,)$. computed as $\\sum s_j q^j$.
   4.  **Fitness Lookup**: Retrieve fitness values from the table.
       -   `fitness_values`: Shape $(N,)$. Values from `fitness_tables` at `table_indices`.
-  5.  **Aggregation**: Compute the mean fitness.
+  5.  **Aggregation**: Compute the mean fitness over valid (masked) positions.
 
   Notes:
   The fitness $F(\\sigma)$ is defined as:
-  $$ F(\\sigma) = \\frac{1}{N} \\sum_{i=0}^{N-1} f_i(\\sigma_i, \\sigma_{i_1}, \\dots, \\sigma_{i_K}) $$
+  $$ F(\\sigma) = \\frac{1}{N_{valid}} \\sum_{i \\in valid} f_i(\\sigma_i, \\sigma_{i_1}, \\dots, \\sigma_{i_K}) $$
 
   where $ (i_1, \\dots, i_K) $ are the epistatic partners of site $ i $.
   We compute the index for the fitness table $ f_i $ as:
@@ -71,14 +79,20 @@ def get_fitness(sequence: EvoSequence, landscape: PyTree) -> Float:
   Args:
       sequence: The sequence to evaluate (Shape: (N,)).
       landscape: The fitness landscape containing 'interactions' and 'fitness_tables'.
+      seq_mask: Optional boolean mask of shape (N,). True for valid positions.
+          If None, all positions are considered valid.
 
   Returns:
-      The mean fitness of the sequence.
+      The mean fitness of the sequence over valid positions.
 
   """
   n_sites = sequence.shape[0]
   interactions = landscape["interactions"]
   n_states = landscape["n_states"]
+
+  # Default mask: all positions valid
+  if seq_mask is None:
+    seq_mask = jnp.ones(n_sites, dtype=jnp.bool_)
 
   self_indices = jnp.arange(n_sites)[:, None]
   gather_indices = jnp.concatenate([self_indices, interactions], axis=1)
@@ -92,7 +106,8 @@ def get_fitness(sequence: EvoSequence, landscape: PyTree) -> Float:
 
   fitness_values = landscape["fitness_tables"][jnp.arange(n_sites), table_indices]
 
-  return jnp.mean(fitness_values)
+  # Masked mean: only count valid positions
+  return jnp.sum(fitness_values * seq_mask) / jnp.sum(seq_mask)
 
 
 batched_get_fitness = jax.vmap(get_fitness, in_axes=(0, None))
@@ -100,10 +115,10 @@ batched_get_fitness = jax.vmap(get_fitness, in_axes=(0, None))
 
 def generate_tree_data(  # noqa: PLR0915
   landscape: PyTree,
-  adjacency: Array,
+  adjacency: Adjacency,
   root_sequence: EvoSequence,
   mutation_rate: float,
-  key: Array,
+  key: PRNGKeyArray,
   coupled_mutation_prob: float = 0.5,
   n_states: int = 20,
 ) -> PhylogeneticTree:
@@ -244,10 +259,10 @@ def generate_tree_data(  # noqa: PLR0915
   )
 
   # Masked sequences are not needed for this part of the task
-  masked_sequences = jnp.zeros_like(all_sequences, dtype=jnp.float32)
+  masked_sequences = jnp.zeros_like(all_sequences, dtype=get_default_dtype())
 
   return PhylogeneticTree(
     masked_sequences=masked_sequences,
-    all_sequences=all_sequences.astype(jnp.float32),
-    adjacency=adjacency.astype(jnp.float32),
+    all_sequences=all_sequences.astype(get_default_dtype()),
+    adjacency=adjacency.astype(get_default_dtype()),
   )
