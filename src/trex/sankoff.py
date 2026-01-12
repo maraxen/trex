@@ -1,6 +1,7 @@
 """JAX implementation of the Sankoff algorithm for phylogenetic reconstruction."""
 
 from functools import partial
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -95,8 +96,6 @@ def run_dp(
 
 vectorized_dp = jax.vmap(run_dp, (None, 0, 0, 1, None), 0)
 
-
-from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
 

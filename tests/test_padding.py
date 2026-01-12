@@ -1,11 +1,11 @@
 """Unit tests for padding.py using pytest and chex."""
 
 import chex
+import jax
 import jax.numpy as jnp
 import pytest
 
 from trex.padding import (
-  K_BUCKETS,
   MAX_NODES,
   N_BUCKETS,
   create_node_mask,
@@ -179,7 +179,6 @@ class TestRecompilationPrevention:
 
   def test_same_bucket_no_recompile(self):
     """Sequences of different length in same bucket should not trigger recompile."""
-    import jax
 
     @jax.jit
     def compute_padded_mean(seq, mask):

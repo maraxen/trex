@@ -121,6 +121,8 @@ def generate_tree_data(  # noqa: PLR0915
   key: PRNGKeyArray,
   coupled_mutation_prob: float = 0.5,
   n_states: int = 20,
+  mutation_rate_noise_std: float = 0.0,
+  branch_length: int = 1,
 ) -> PhylogeneticTree:
   """Generate a tree of sequences using the NK model.
 
@@ -132,6 +134,8 @@ def generate_tree_data(  # noqa: PLR0915
       key: A JAX random key.
       coupled_mutation_prob: The probability of performing a coupled mutation.
       n_states: The alphabet size for mutations. Should match the landscape's n_states.
+      mutation_rate_noise_std: Standard deviation of log-normal noise for mutation rate.
+      branch_length: Number of mutation steps per edge.
 
   Returns:
       A PhylogeneticTree object containing the generated sequences.
@@ -196,52 +200,58 @@ def generate_tree_data(  # noqa: PLR0915
     parent_index = parent_indices[node_index]
 
     def evolve(parent_sequence: jax.Array, key: jax.Array) -> tuple[jax.Array, jax.Array]:
-      def random_mutation(key: jax.Array, parent_sequence: jax.Array) -> jax.Array:
-        # Standard random mutation
-        key, subkey = jax.random.split(key)
-        mutation_mask = jax.random.bernoulli(subkey, mutation_rate, (seq_length,))
-        key, subkey = jax.random.split(key)
-        new_values = jax.random.randint(subkey, (seq_length,), 0, n_states)
-        return jnp.where(
-          mutation_mask,
-          new_values,
-          parent_sequence,
+      # Sample per-edge mutation rate using log-normal noise
+      # rate = base_rate * exp(N(0, std))
+      key, subkey = jax.random.split(key)
+      noise = jax.random.normal(subkey) * mutation_rate_noise_std
+
+      # Use log-normal noise on the mutation rate
+      # Clamping only the upper bound to 1.0, lower bound is naturally > 0 via exp
+      mr_unclamped = mutation_rate * jnp.exp(noise)
+      current_mutation_rate = jnp.minimum(mr_unclamped, 1.0)
+
+      def step_fun(step_i: int, carry: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
+        seq, k = carry
+
+        def random_mutation(k: jax.Array, p_seq: jax.Array) -> jax.Array:
+          k, sk = jax.random.split(k)
+          mutation_mask = jax.random.bernoulli(sk, current_mutation_rate, (seq_length,))
+          k, sk = jax.random.split(k)
+          new_vals = jax.random.randint(sk, (seq_length,), 0, n_states)
+          return jnp.where(mutation_mask, new_vals, p_seq)
+
+        def coupled_mutation(k: jax.Array, p_seq: jax.Array) -> jax.Array:
+          k, sk1, sk2 = jax.random.split(k, 3)
+          site = jax.random.randint(sk1, (), 0, seq_length)
+          interacting = landscape["interactions"][site]
+          sites = jnp.append(jnp.array([site]), interacting)
+          mask = jnp.zeros_like(p_seq, dtype=bool).at[sites].set(True)
+          vals = jax.random.randint(sk2, (seq_length,), 0, n_states)
+          return jnp.where(mask, vals, p_seq)
+
+        k, sk = jax.random.split(k)
+        mutated_seq = jax.lax.cond(
+          jax.random.bernoulli(sk, coupled_mutation_prob),
+          lambda k_, s_: coupled_mutation(k_, s_),
+          lambda k_, s_: random_mutation(k_, s_),
+          k,
+          seq,
         )
 
-      def coupled_mutation(key: jax.Array, parent_sequence: jax.Array) -> jax.Array:
-        # Coupled mutation on interacting sites
-        key, subkey1, subkey2 = jax.random.split(key, 3)
-        site_to_mutate = jax.random.randint(subkey1, (), 0, seq_length)
-        interacting_sites = landscape["interactions"][site_to_mutate]
-        sites_to_mutate = jnp.append(jnp.array([site_to_mutate]), interacting_sites)
+        # Metropolis-Hastings step
+        parent_fitness = get_fitness(seq, landscape)
+        mutated_fitness = get_fitness(mutated_seq, landscape)
+        acceptance_prob = jnp.exp(mutated_fitness - parent_fitness)
 
-        mutation_mask = jnp.zeros_like(parent_sequence, dtype=bool).at[sites_to_mutate].set(True)
+        k, sk = jax.random.split(k)
+        accepted = jax.random.bernoulli(sk, jnp.minimum(1.0, acceptance_prob))
 
-        new_values = jax.random.randint(subkey2, (seq_length,), 0, n_states)
-        return jnp.where(
-          mutation_mask,
-          new_values,
-          parent_sequence,
-        )
+        return jnp.where(accepted, mutated_seq, seq), k
 
-      key, subkey = jax.random.split(key)
-      mutated_sequence = jax.lax.cond(
-        jax.random.bernoulli(subkey, coupled_mutation_prob),
-        coupled_mutation,
-        random_mutation,
-        key,
-        parent_sequence,
-      )
+      # Apply multiple steps based on branch_length
+      final_seq, final_key = jax.lax.fori_loop(0, branch_length, step_fun, (parent_sequence, key))
 
-      # Metropolis-Hastings step
-      parent_fitness = get_fitness(parent_sequence, landscape)
-      mutated_fitness = get_fitness(mutated_sequence, landscape)
-      acceptance_prob = jnp.exp(mutated_fitness - parent_fitness)
-
-      key, subkey = jax.random.split(key)
-      accepted = jax.random.bernoulli(subkey, jnp.minimum(1.0, acceptance_prob))
-
-      return jnp.asarray(jnp.where(accepted, mutated_sequence, parent_sequence)), key
+      return final_seq, final_key
 
     evolved_sequence, new_key = jax.lax.cond(
       node_index != root_node,

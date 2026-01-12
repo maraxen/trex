@@ -183,7 +183,11 @@ def pad_fitness_table(
 
 
 def pad_interactions(
-  interactions: Array, real_n: int, real_k: int, target_n: int, target_k: int,
+  interactions: Array,
+  real_n: int,
+  real_k: int,
+  target_n: int,
+  target_k: int,
 ) -> Array:
   """Pad interaction indices for the NK model.
 
@@ -233,7 +237,9 @@ def pad_adjacency(adjacency: Array, target_nodes: int = MAX_NODES) -> Array:
 
 
 def pad_tree_sequences(
-  sequences: Array, target_nodes: int = MAX_NODES, target_n: int | None = None,
+  sequences: Array,
+  target_nodes: int = MAX_NODES,
+  target_n: int | None = None,
 ) -> Array:
   """Pad tree sequences to target dimensions.
 

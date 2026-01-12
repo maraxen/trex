@@ -83,4 +83,5 @@ def test_compute_loss_basic():
   # Dummy adjacency matrix for the test
   adjacency = jnp.eye(4)
   loss = compute_loss(key, params, seqs, metadata, temperature=1.0, adjacency=adjacency)
-  assert not jnp.isnan(loss) and loss >= 0
+  assert not jnp.isnan(loss)
+  assert loss >= 0

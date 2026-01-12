@@ -118,8 +118,7 @@ def test_fixed_topology_learned_sequences():
   def train_step(current_params, current_opt_state):
     def loss_fn(p):
       updated_sequences = update_seq(p, initial_sequences_for_loss, temperature=1.0)
-      surrogate_cost = compute_surrogate_cost(updated_sequences, gt_adjacency_one_hot)
-      return surrogate_cost
+      return compute_surrogate_cost(updated_sequences, gt_adjacency_one_hot)
 
     loss_val, grads = jax.value_and_grad(loss_fn)(current_params)
     grad_mask = {
@@ -131,8 +130,8 @@ def test_fixed_topology_learned_sequences():
     new_params = optax.apply_updates(current_params, updates)
     return new_params, new_opt_state, loss_val
 
-  for epoch in range(5000):
-    params, opt_state, loss = train_step(params, opt_state)
+  for _epoch in range(5000):
+    params, opt_state, _loss = train_step(params, opt_state)
 
   # Evaluation
   learned_sequences_one_hot = update_seq(params, initial_sequences_for_loss, temperature=0.01)
@@ -181,9 +180,9 @@ def test_fixed_sequences_learned_topology():
     new_params = optax.apply_updates(current_params, updates)
     return new_params, new_opt_state, loss_val
 
-  for epoch in range(3000):
+  for _epoch in range(3000):
     key, step_key = jax.random.split(key)
-    params, opt_state, loss = train_step(params, opt_state, step_key)
+    params, opt_state, _loss = train_step(params, opt_state, step_key)
 
   # Evaluation
   learned_tree_soft = update_tree(key, params, temperature=0.01)
@@ -259,7 +258,7 @@ def test_joint_optimization():
   for epoch in range(5000):
     key, step_key = jax.random.split(key)
     temp = jnp.maximum(0.1, 2.0 * (1.0 - epoch / 5000))
-    params, opt_state, loss = train_step(params, opt_state, temp, step_key)
+    params, opt_state, _loss = train_step(params, opt_state, temp, step_key)
 
   # Evaluation
   learned_seqs = update_seq(params, initial_sequences_for_loss, temperature=0.01)

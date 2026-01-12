@@ -55,6 +55,7 @@ tests = [
 line-length = 100
 indent-width = 2
 fix = true
+exclude = ["tests"]
 
 [tool.ruff.lint]
 select = ["ALL"]
@@ -77,6 +78,11 @@ ignore = [
   "E501", # line too long
 ]
 pylint.max-args = 15
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+  "S101", # assert allowed in tests
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
