@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -26,6 +27,7 @@ from trex.nk_model import create_nk_model_landscape, generate_tree_data
 from trex.sankoff import run_sankoff
 from trex.tree import compute_soft_cost, compute_surrogate_cost, update_seq
 from trex.types import Adjacency, Ancestors, LeafSequences, ScalarFloat, get_default_dtype
+from trex.utils.memory import safe_map
 from trex.utils.types import (
   EvoSequence,
   OneHotEvoSequence,
@@ -238,8 +240,10 @@ def _compute_loss_landscape_aware_stacked(
   adj_matrix: Adjacency,
   n_all: int,
   lambda_val: float,
+  real_k: int,
   temperature: float = 1.0,
   seq_mask: Bool[Array, seq_len] | None = None,
+  batch_size: int = 64,
 ) -> ScalarFloat:
   """Compute landscape-aware loss using stacked ancestors (vmap-compatible).
 
@@ -276,14 +280,16 @@ def _compute_loss_landscape_aware_stacked(
 
   # 2. Parental Guidance Fitness Cost (only if lambda > 0 AND k > 0)
   # K=0 means no epistasis, so fitness cost has no meaningful signal
-  k = landscape["k"]
-
-  def compute_fitness_cost():
+  # real_k is a static Python int, so we can use Python if to completely avoid
+  # tracing the expensive branch when K=0
+  if (lambda_val > 0.0) and (real_k > 0):
     parent_indices = jnp.argmax(adj_matrix, axis=1)
     parent_soft_seqs = updated_sequences[parent_indices]
     child_soft_seqs = updated_sequences
 
-    parent_logits = compute_parental_logits(parent_soft_seqs, landscape)
+    parent_logits = compute_parental_logits(
+      parent_soft_seqs, landscape, real_k, batch_size=batch_size
+    )
 
     log_predictions = jax.nn.log_softmax(parent_logits, axis=-1)
 
@@ -293,19 +299,30 @@ def _compute_loss_landscape_aware_stacked(
     cross_entropy = jnp.sum(masked_ce)
 
     is_root = jnp.arange(n_all) == parent_indices
-    return cross_entropy / (jnp.sum(~is_root) * jnp.sum(seq_mask))
-
-  # Skip fitness computation if lambda is zero OR k is zero (no epistasis)
-  should_compute_fitness = (lambda_val > 0.0) & (k > 0)
-  fitness_cost = jax.lax.cond(
-    should_compute_fitness,
-    compute_fitness_cost,
-    lambda: 0.0,
-  )
+    fitness_cost = cross_entropy / (jnp.sum(~is_root) * jnp.sum(seq_mask))
+  else:
+    fitness_cost = 0.0
 
   return surrogate_cost + lambda_val * fitness_cost
 
 
+@functools.partial(
+  jax.jit,
+  static_argnames=(
+    "n_all",
+    "n_leaves",
+    "n_states",
+    "lambda_val",
+    "real_k",
+    "optimizer_name",
+    "learning_rate",
+    "n_iterations",
+    "return_losses",
+    "dtype",
+    "mixed_precision",
+    "inference_batch_size",
+  ),
+)
 def run_trex_landscape_aware_configurable(
   leaf_sequences: LeafSequences,
   n_all: int,
@@ -315,6 +332,7 @@ def run_trex_landscape_aware_configurable(
   lambda_val: float,
   adj_matrix: Adjacency,
   key: PRNGKeyArray,
+  real_k: int = 0,
   optimizer_name: str = "adam",
   learning_rate: float = 1e-3,
   n_iterations: int = 10000,
@@ -322,6 +340,7 @@ def run_trex_landscape_aware_configurable(
   dtype: jnp.dtype | None = None,
   seq_mask: Bool[Array, seq_len] | None = None,
   mixed_precision: bool = False,
+  inference_batch_size: int = 64,
 ) -> Ancestors | tuple[Ancestors, Float[Array, n_iterations]]:
   """Run landscape-aware TREX optimization with configurable hyperparameters.
 
@@ -393,8 +412,10 @@ def run_trex_landscape_aware_configurable(
       adj_matrix,
       n_all,
       lambda_val,
+      real_k,
       temperature=1.0,
       seq_mask=seq_mask,
+      batch_size=inference_batch_size,
     )
 
   loss_and_grad = jax.value_and_grad(loss_fn)
@@ -565,6 +586,8 @@ straight_through_estimator.defvjp(ste_fwd, ste_bwd)
 def compute_parental_logits(
   parent_sequences: OneHotEvoSequence,
   landscape: PyTree,
+  real_k: int,
+  batch_size: int = 64,
 ) -> Float[Array, "n_parents seq_len n_states"]:
   """Compute 'parental logits' for each site for a batch of parent sequences.
 
@@ -574,15 +597,21 @@ def compute_parental_logits(
 
   Handles K=0 (no epistasis) by returning fitness tables directly.
 
+  Args:
+      parent_sequences: Soft one-hot sequences, shape (n_parents, seq_len, n_states)
+      landscape: NK landscape dict with 'interactions' and 'fitness_tables'
+      real_k: The real K value (static, not traced) for conditional logic
+      batch_size: Batch size for safe_map
+
   Returns a tensor of shape (num_parents, seq_len, n_states).
   """
   n_parents, seq_len, n_states = parent_sequences.shape
   fitness_tables = landscape["fitness_tables"]  # Shape: (N, n_states**(k+1))
-  interactions = landscape["interactions"]  # Shape: (N, k)
-  k = interactions.shape[1]
+  interactions = landscape["interactions"]  # Shape: (N, padded_k)
 
   # Handle K=0 case: no epistasis, fitness depends only on site's own state
-  if k == 0:
+  # real_k is a static Python int, so this Python if works at trace time
+  if real_k == 0:
     # fitness_tables has shape (N, n_states) when k=0
     # Each row is the fitness for each state at that site
     # Broadcast to all parents: (seq_len, n_states) -> (n_parents, seq_len, n_states)
@@ -593,17 +622,17 @@ def compute_parental_logits(
     # i: index of the site we're computing logits for
     # parent_seqs: all parent sequences, shape (n_parents, seq_len, n_states)
 
-    # 1. Get the k neighbors for site i
-    neighbors = interactions[i]
+    # 1. Get the real_k neighbors for site i (use only first real_k columns of interactions)
+    neighbors = interactions[i, :real_k]
 
     # 2. Get the parent's soft probabilities for those neighbors
-    # Shape: (n_parents, k, n_states)
+    # Shape: (n_parents, real_k, n_states)
     neighbor_probs = parent_seqs[:, neighbors, :]
 
     # 3. Compute the joint probability distribution over the neighbors' states
     # Starts with shape (n_parents, n_states)
     joint_neighbor_probs = neighbor_probs[:, 0, :]
-    for j in range(1, k):
+    for j in range(1, real_k):
       # Outer product using einsum
       next_neighbor = neighbor_probs[:, j, :]
       combined = jnp.einsum("pc,ps->pcs", joint_neighbor_probs, next_neighbor)
@@ -611,23 +640,24 @@ def compute_parental_logits(
 
     # 4. Reshape the fitness table for site i
     # The table encodes fitness F(state_i, state_neighbors).
-    # We reshape it to (n_states, 2**k) to separate the two dimensions.
+    # We reshape it to (n_states, n_states**real_k) to separate the two dimensions.
     site_fitness_table = fitness_tables[i].reshape(n_states, -1)
 
     # 5. Compute the marginalized fitness (our logits)
     # This is the matrix-vector product of the fitness table and the neighbor probabilities.
     # It calculates the expected fitness for each state of site 'i'.
-    # (n_states, 2**k) @ (n_parents, 2**k)^T -> (n_states, n_parents) -> (n_parents, n_states)
+    # (n_states, n_states**real_k) @ (n_parents, n_states**real_k)^T -> (n_states, n_parents) -> (n_parents, n_states)
     return jnp.einsum("si,pi->ps", site_fitness_table, joint_neighbor_probs)
 
-  # Use vmap to apply this logic to all N sites in parallel.
+  # Use safe_map to apply this logic to all N sites in parallel safely.
   # We are mapping over the integer index of the site.
-  all_logits = jax.vmap(compute_logits_for_one_site, in_axes=(0, None))(
+  all_logits = safe_map(
+    lambda i: compute_logits_for_one_site(i, parent_sequences),
     jnp.arange(seq_len),
-    parent_sequences,
+    batch_size=batch_size,
   )
 
-  # The vmap output is (seq_len, n_parents, n_states), so we transpose it
+  # The safe_map result is (seq_len, n_parents, n_states), so we transpose it
   return jnp.transpose(all_logits, (1, 0, 2))
 
 
@@ -643,6 +673,7 @@ def compute_loss_landscape_aware(
   lambda_val: float,
   *,
   fix_tree: bool = True,
+  batch_size: int = 64,
 ) -> ScalarFloat:
   """Compute surrogate cost + parental guidance cross-entropy cost."""
   updated_sequences = update_seq(params, sequences, temperature)
@@ -659,7 +690,7 @@ def compute_loss_landscape_aware(
   child_soft_seqs = updated_sequences
 
   # Compute the fitness-derived logits from the parents
-  parent_logits = compute_parental_logits(parent_soft_seqs, landscape)
+  parent_logits = compute_parental_logits(parent_soft_seqs, landscape, batch_size=batch_size)
 
   # Calculate cross-entropy loss: -Σ y * log(softmax(x))
   # where y is the child distribution and x is the parent logits.
@@ -682,6 +713,7 @@ def run_trex_landscape_aware(
   lambda_val: float,
   adj_matrix: Adjacency,
   key: PRNGKeyArray,
+  inference_batch_size: int = 64,
 ) -> Ancestors:
   """Run the TREX optimization with the landscape-aware loss."""
   key, subkey = jax.random.split(key)
@@ -727,6 +759,7 @@ def run_trex_landscape_aware(
       lambda_val=lambda_val,
       fix_tree=True,
       adj_matrix=adj_matrix,
+      batch_size=inference_batch_size,
     )
     # jax.debug.print("Grads: {grads}", grads=grads)
     updates, opt_state = optimizer.update(grads, opt_state, params)
