@@ -618,21 +618,23 @@ def compute_parental_logits(
     return jnp.broadcast_to(fitness_tables[None, :, :], (n_parents, seq_len, n_states))
 
   # K > 0: compute marginalized fitness over neighbors
+  k_eff = interactions.shape[1]
+
   def compute_logits_for_one_site(i, parent_seqs):
     # i: index of the site we're computing logits for
     # parent_seqs: all parent sequences, shape (n_parents, seq_len, n_states)
 
-    # 1. Get the real_k neighbors for site i (use only first real_k columns of interactions)
-    neighbors = interactions[i, :real_k]
+    # 1. Get the k_eff neighbors for site i
+    neighbors = interactions[i, :k_eff]
 
     # 2. Get the parent's soft probabilities for those neighbors
-    # Shape: (n_parents, real_k, n_states)
+    # Shape: (n_parents, k_eff, n_states)
     neighbor_probs = parent_seqs[:, neighbors, :]
 
     # 3. Compute the joint probability distribution over the neighbors' states
     # Starts with shape (n_parents, n_states)
     joint_neighbor_probs = neighbor_probs[:, 0, :]
-    for j in range(1, real_k):
+    for j in range(1, k_eff):
       # Outer product using einsum
       next_neighbor = neighbor_probs[:, j, :]
       combined = jnp.einsum("pc,ps->pcs", joint_neighbor_probs, next_neighbor)
@@ -640,13 +642,13 @@ def compute_parental_logits(
 
     # 4. Reshape the fitness table for site i
     # The table encodes fitness F(state_i, state_neighbors).
-    # We reshape it to (n_states, n_states**real_k) to separate the two dimensions.
+    # We reshape it to (n_states, n_states**k_eff) to separate the two dimensions.
     site_fitness_table = fitness_tables[i].reshape(n_states, -1)
 
     # 5. Compute the marginalized fitness (our logits)
     # This is the matrix-vector product of the fitness table and the neighbor probabilities.
     # It calculates the expected fitness for each state of site 'i'.
-    # (n_states, n_states**real_k) @ (n_parents, n_states**real_k)^T -> (n_states, n_parents) -> (n_parents, n_states)
+    # (n_states, n_states**k_eff) @ (n_parents, n_states**k_eff)^T -> (n_states, n_parents) -> (n_parents, n_states)
     return jnp.einsum("si,pi->ps", site_fitness_table, joint_neighbor_probs)
 
   # Use safe_map to apply this logic to all N sites in parallel safely.
