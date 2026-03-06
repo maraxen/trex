@@ -26,6 +26,7 @@ from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray, PyTree
 from trex.nk_model import create_nk_model_landscape, generate_tree_data
 from trex.sankoff import run_sankoff
 from trex.tree import compute_soft_cost, compute_surrogate_cost, update_seq
+from asr.mpnn_loss import compute_mpnn_loss
 from trex.types import Adjacency, Ancestors, LeafSequences, ScalarFloat, get_default_dtype
 from trex.utils.memory import safe_map
 from trex.utils.types import (
@@ -241,9 +242,12 @@ def _compute_loss_landscape_aware_stacked(
   n_all: int,
   lambda_val: float,
   real_k: int,
+  key: PRNGKeyArray,
   temperature: float = 1.0,
   seq_mask: Bool[Array, seq_len] | None = None,
   batch_size: int = 64,
+  lambda_mpnn: float = 0.0,
+  pdb_path: str | None = None,
 ) -> ScalarFloat:
   """Compute landscape-aware loss using stacked ancestors (vmap-compatible).
 
@@ -303,7 +307,19 @@ def _compute_loss_landscape_aware_stacked(
   else:
     fitness_cost = 0.0
 
-  return surrogate_cost + lambda_val * fitness_cost
+  # 3. MPNN Cross-Entropy Cost
+  if (lambda_mpnn > 0.0) and (pdb_path is not None):
+    # Only ancestors (n_all - n_leaves) are used for MPNN loss, shape: (n_ancestors, seq_len, n_states)
+    ancestors_soft_seqs = updated_sequences[n_leaves:]
+    mpnn_cost = compute_mpnn_loss(
+      soft_seqs=ancestors_soft_seqs,
+      pdb_path=pdb_path,
+      key=key,
+    )
+  else:
+    mpnn_cost = 0.0
+
+  return surrogate_cost + lambda_val * fitness_cost + lambda_mpnn * mpnn_cost
 
 
 @functools.partial(
@@ -321,6 +337,8 @@ def _compute_loss_landscape_aware_stacked(
     "dtype",
     "mixed_precision",
     "inference_batch_size",
+    "lambda_mpnn",
+    "pdb_path",
   ),
 )
 def run_trex_landscape_aware_configurable(
@@ -341,6 +359,8 @@ def run_trex_landscape_aware_configurable(
   seq_mask: Bool[Array, seq_len] | None = None,
   mixed_precision: bool = False,
   inference_batch_size: int = 64,
+  lambda_mpnn: float = 0.0,
+  pdb_path: str | None = None,
 ) -> Ancestors | tuple[Ancestors, Float[Array, n_iterations]]:
   """Run landscape-aware TREX optimization with configurable hyperparameters.
 
@@ -370,7 +390,7 @@ def run_trex_landscape_aware_configurable(
       If return_losses=True: Tuple of (ancestors, loss_curve)
 
   """
-  key, subkey = jax.random.split(key)
+  key, subkey, loop_key = jax.random.split(key, 3)
   seq_len = leaf_sequences.shape[1]
   n_ancestors = n_all - n_leaves
 
@@ -401,7 +421,7 @@ def run_trex_landscape_aware_configurable(
   )
 
   # Define loss function with seq_mask
-  def loss_fn(ancestors):
+  def loss_fn(ancestors, current_key):
     # Cast params to compute_dtype for forward pass if mixed precision
     ancestors_compute = ancestors.astype(compute_dtype)
     return _compute_loss_landscape_aware_stacked(
@@ -413,9 +433,12 @@ def run_trex_landscape_aware_configurable(
       n_all,
       lambda_val,
       real_k,
+      key=current_key,
       temperature=1.0,
       seq_mask=seq_mask,
       batch_size=inference_batch_size,
+      lambda_mpnn=lambda_mpnn,
+      pdb_path=pdb_path,
     )
 
   loss_and_grad = jax.value_and_grad(loss_fn)
@@ -423,15 +446,16 @@ def run_trex_landscape_aware_configurable(
   if return_losses:
 
     def scan_step(carry, _):
-      ancestors, opt_state = carry
-      loss, grads = loss_and_grad(ancestors)
+      ancestors, opt_state, step_key = carry
+      step_key, loss_key = jax.random.split(step_key)
+      loss, grads = loss_and_grad(ancestors, loss_key)
       updates, opt_state = optimizer.update(grads, opt_state, ancestors)
       ancestors = optax.apply_updates(ancestors, updates)
-      return (ancestors, opt_state), loss
+      return (ancestors, opt_state, step_key), loss
 
-    (ancestors, _), losses = jax.lax.scan(
+    (ancestors, _, _), losses = jax.lax.scan(
       scan_step,
-      (ancestors, opt_state),
+      (ancestors, opt_state, loop_key),
       None,
       length=n_iterations,
     )
@@ -440,17 +464,18 @@ def run_trex_landscape_aware_configurable(
 
   # Use fori_loop when losses not needed
   def training_step(_, carry):
-    ancestors, opt_state = carry
-    _, grads = loss_and_grad(ancestors)
+    ancestors, opt_state, step_key = carry
+    step_key, loss_key = jax.random.split(step_key)
+    _, grads = loss_and_grad(ancestors, loss_key)
     updates, opt_state = optimizer.update(grads, opt_state, ancestors)
     ancestors = optax.apply_updates(ancestors, updates)
-    return ancestors, opt_state
+    return ancestors, opt_state, step_key
 
-  ancestors, _ = jax.lax.fori_loop(
+  ancestors, _, _ = jax.lax.fori_loop(
     0,
     n_iterations,
     training_step,
-    (ancestors, opt_state),
+    (ancestors, opt_state, loop_key),
   )
 
   return jnp.argmax(ancestors, axis=-1)
