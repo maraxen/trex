@@ -11,7 +11,7 @@ sequences according to the NK landscape.
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 import functools
 import jax
@@ -26,13 +26,15 @@ from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray, PyTree
 from trex.nk_model import create_nk_model_landscape, generate_tree_data
 from trex.sankoff import run_sankoff
 from trex.tree import compute_soft_cost, compute_surrogate_cost, update_seq
-from asr.mpnn_loss import compute_mpnn_loss
+
 from trex.types import Adjacency, Ancestors, LeafSequences, ScalarFloat, get_default_dtype
 from trex.utils.memory import safe_map
 from trex.utils.types import (
   EvoSequence,
   OneHotEvoSequence,
 )
+
+from trex.interactions import WeightedLoss, build_total_loss
 
 # ============================================================================
 # Optimizer Factory and Configurable TREX Optimization
@@ -247,7 +249,9 @@ def _compute_loss_landscape_aware_stacked(
   seq_mask: Bool[Array, seq_len] | None = None,
   batch_size: int = 64,
   lambda_mpnn: float = 0.0,
-  pdb_path: str | None = None,
+  landscape_type: str = "nk",
+  mpnn_loss_fn: Callable | None = None,
+  potts_loss_fn: Callable | None = None,
 ) -> ScalarFloat:
   """Compute landscape-aware loss using stacked ancestors (vmap-compatible).
 
@@ -282,44 +286,85 @@ def _compute_loss_landscape_aware_stacked(
   # But compute_surrogate_cost operates on the full array, so we mask the output
   surrogate_cost = compute_surrogate_cost(updated_sequences, adj_matrix)
 
-  # 2. Parental Guidance Fitness Cost (only if lambda > 0 AND k > 0)
-  # K=0 means no epistasis, so fitness cost has no meaningful signal
-  # real_k is a static Python int, so we can use Python if to completely avoid
-  # tracing the expensive branch when K=0
-  if (lambda_val > 0.0) and (real_k > 0):
-    parent_indices = jnp.argmax(adj_matrix, axis=1)
-    parent_soft_seqs = updated_sequences[parent_indices]
-    child_soft_seqs = updated_sequences
+  # 2–3. Interaction losses (NK / Potts / MPNN) via trex.interactions composition.
+  # Branches are gated by static Python values so only the active path is traced.
+  # split_keys=False matches the historical single-key MPNN contract (same key as this fn).
+  weighted_losses: list[WeightedLoss] = []
 
-    parent_logits = compute_parental_logits(
-      parent_soft_seqs, landscape, real_k, batch_size=batch_size
-    )
+  if (lambda_val > 0.0) and (landscape_type == "potts"):
+    if potts_loss_fn is None:
+      raise ValueError(
+        "potts_loss_fn is required when landscape_type='potts' and lambda_val > 0. "
+        "Inject a callable with signature (soft_ancestors, potts_model) -> scalar, "
+        "typically the Potts energy from your ASR package."
+      )
 
-    log_predictions = jax.nn.log_softmax(parent_logits, axis=-1)
+    def _potts_fn(
+      soft_ancestors: Float[Array, "n_ancestors seq_len n_states"],
+      soft_all: Float[Array, "n_nodes seq_len n_states"],
+      adj: Adjacency,
+      k: PRNGKeyArray,
+    ) -> Float[Array, ""]:
+      del soft_all, adj, k
+      return potts_loss_fn(soft_ancestors, landscape)
 
-    # Masked cross-entropy: only count valid positions
-    per_position_ce = -jnp.sum(child_soft_seqs * log_predictions, axis=-1)  # (n_all, seq_len)
-    masked_ce = per_position_ce * seq_mask[None, :]  # Broadcast mask
-    cross_entropy = jnp.sum(masked_ce)
+    weighted_losses.append(WeightedLoss("potts", lambda_val, _potts_fn))
 
-    is_root = jnp.arange(n_all) == parent_indices
-    fitness_cost = cross_entropy / (jnp.sum(~is_root) * jnp.sum(seq_mask))
-  else:
-    fitness_cost = 0.0
+  elif (lambda_val > 0.0) and (real_k > 0) and (landscape_type == "nk"):
 
-  # 3. MPNN Cross-Entropy Cost
-  if (lambda_mpnn > 0.0) and (pdb_path is not None):
-    # Only ancestors (n_all - n_leaves) are used for MPNN loss, shape: (n_ancestors, seq_len, n_states)
-    ancestors_soft_seqs = updated_sequences[n_leaves:]
-    mpnn_cost = compute_mpnn_loss(
-      soft_seqs=ancestors_soft_seqs,
-      pdb_path=pdb_path,
-      key=key,
-    )
-  else:
-    mpnn_cost = 0.0
+    def _nk_fn(
+      soft_ancestors: Float[Array, "n_ancestors seq_len n_states"],
+      soft_all: Float[Array, "n_nodes seq_len n_states"],
+      adj: Adjacency,
+      k: PRNGKeyArray,
+    ) -> Float[Array, ""]:
+      del soft_ancestors, k
+      parent_indices = jnp.argmax(adj, axis=1)
+      parent_soft_seqs = soft_all[parent_indices]
+      child_soft_seqs = soft_all
 
-  return surrogate_cost + lambda_val * fitness_cost + lambda_mpnn * mpnn_cost
+      parent_logits = compute_parental_logits(
+        parent_soft_seqs, landscape, real_k, batch_size=batch_size
+      )
+
+      log_predictions = jax.nn.log_softmax(parent_logits, axis=-1)
+
+      per_position_ce = -jnp.sum(child_soft_seqs * log_predictions, axis=-1)  # (n_all, seq_len)
+      masked_ce = per_position_ce * seq_mask[None, :]
+      cross_entropy = jnp.sum(masked_ce)
+
+      is_root = jnp.arange(n_all) == parent_indices
+      return cross_entropy / (jnp.sum(~is_root) * jnp.sum(seq_mask))
+
+    weighted_losses.append(WeightedLoss("nk_fitness", lambda_val, _nk_fn))
+
+  if lambda_mpnn > 0.0:
+    if mpnn_loss_fn is None:
+      raise ValueError(
+        "mpnn_loss_fn is required when lambda_mpnn > 0. "
+        "Build a structure-conditioned MPNN loss in the caller (see your ASR integration) "
+        "and pass (soft_ancestors, key) -> scalar here."
+      )
+
+    def _mpnn_fn(
+      soft_ancestors: Float[Array, "n_ancestors seq_len n_states"],
+      soft_all: Float[Array, "n_nodes seq_len n_states"],
+      adj: Adjacency,
+      k: PRNGKeyArray,
+    ) -> Float[Array, ""]:
+      del soft_all, adj
+      return mpnn_loss_fn(soft_ancestors, k)
+
+    weighted_losses.append(WeightedLoss("mpnn", lambda_mpnn, _mpnn_fn))
+
+  interaction_total, _ = build_total_loss(tuple(weighted_losses), split_keys=False)(
+    updated_sequences[n_leaves:],
+    updated_sequences,
+    adj_matrix,
+    key,
+  )
+
+  return surrogate_cost + interaction_total
 
 
 @functools.partial(
@@ -338,7 +383,9 @@ def _compute_loss_landscape_aware_stacked(
     "mixed_precision",
     "inference_batch_size",
     "lambda_mpnn",
-    "pdb_path",
+    "landscape_type",
+    "potts_loss_fn",
+    "mpnn_loss_fn",
   ),
 )
 def run_trex_landscape_aware_configurable(
@@ -360,7 +407,10 @@ def run_trex_landscape_aware_configurable(
   mixed_precision: bool = False,
   inference_batch_size: int = 64,
   lambda_mpnn: float = 0.0,
-  pdb_path: str | None = None,
+  landscape_type: str = "nk",
+  *,
+  potts_loss_fn: Callable | None = None,
+  mpnn_loss_fn: Callable | None = None,
 ) -> Ancestors | tuple[Ancestors, Float[Array, n_iterations]]:
   """Run landscape-aware TREX optimization with configurable hyperparameters.
 
@@ -384,6 +434,10 @@ def run_trex_landscape_aware_configurable(
       seq_mask: Optional boolean mask of shape (seq_len,). True for valid positions.
           If None, all positions are considered valid.
       mixed_precision: If True, keep parameters in float32 but compute in dtype
+      potts_loss_fn: Required when ``landscape_type == "potts"`` and ``lambda_val > 0``.
+          Callable ``(soft_ancestors, potts_model) -> scalar`` (injected by the caller).
+      mpnn_loss_fn: Required when ``lambda_mpnn > 0``. Callable
+          ``(soft_ancestors, key) -> scalar``, built in the caller for your structure backend.
 
   Returns:
       If return_losses=False: Reconstructed ancestor sequences (n_ancestors, seq_len)
@@ -438,7 +492,9 @@ def run_trex_landscape_aware_configurable(
       seq_mask=seq_mask,
       batch_size=inference_batch_size,
       lambda_mpnn=lambda_mpnn,
-      pdb_path=pdb_path,
+      landscape_type=landscape_type,
+      mpnn_loss_fn=mpnn_loss_fn,
+      potts_loss_fn=potts_loss_fn,
     )
 
   loss_and_grad = jax.value_and_grad(loss_fn)
